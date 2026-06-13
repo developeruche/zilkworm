@@ -47,11 +47,16 @@ void FlatNodeStore::populate_from_rlp(ByteView trie_rlp) {
             break;
         }
 
-        auto hdr = fast_decode_header(trie_view);
-        uint32_t payload_off = static_cast<uint32_t>(trie_view.data() - hash_start);
-        uint32_t payload_len = static_cast<uint32_t>(hdr.payload_length);
+        // Record start of full node RLP (before stripping the list header).
+        const uint8_t* node_rlp_start = trie_view.data();  // = hash_start + 32
+        auto hdr = fast_decode_header(trie_view);           // advances past list header
+        uint32_t header_size = static_cast<uint32_t>(trie_view.data() - node_rlp_start);
+        // payload_off: offset from hash_start to the start of the full node RLP.
+        uint32_t payload_off = static_cast<uint32_t>(node_rlp_start - hash_start);  // == 32
+        // payload_len: length of the FULL node RLP (list header + list payload).
+        uint32_t payload_len = header_size + static_cast<uint32_t>(hdr.payload_length);
         uint64_t off_len = (static_cast<uint64_t>(payload_off) << 32) | payload_len;
-        trie_view.remove_prefix(payload_len);
+        trie_view.remove_prefix(hdr.payload_length);
 
         auto [it, inserted] = storage_.emplace(node_hash, NodeRef{hash_start, off_len});
         if (!inserted) [[unlikely]] {
