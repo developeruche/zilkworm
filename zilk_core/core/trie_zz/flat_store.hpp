@@ -3,10 +3,13 @@
 #pragma once
 
 #include <cstring>
+#include <deque>
+#include <span>
 #include <unordered_map>  // must come after evmc.hpp so operator== is visible
 #include <vector>
 
 #include "node_store_i.hpp"  // includes evmc.hpp which defines operator== for bytes32
+#include <zilk_core/core/common/bytes.hpp>
 #include <zilk_core/core/rlp/encode.hpp>
 
 namespace silkworm::mpt {
@@ -62,11 +65,20 @@ class FlatNodeStore final : public NodeStore {
 
     FlatNodeStore() = default;
 
-    void clear() { storage_.clear(); collisions_.clear(); }
+    void clear() { storage_.clear(); collisions_.clear(); owned_.clear(); }
     size_t size() const { return storage_.size(); }
     // Populate the store from RLP-encoded trie node byteviews
     // Layout: [rlp{32-byte hash, bytes}, rlp{32-byte hash, bytes}, ...]
     void populate_from_rlp(ByteView trie_rlp);
+
+    // Populate the store from raw MPT node preimages (the canonical stateless
+    // witness format, EIP-8025 / stateless_ssz.py: `ExecutionWitness.state` is
+    // a flat list of RLP-encoded trie nodes with no precomputed hashes).
+    // Hashes each node with keccak256. Entries are stored in an owned,
+    // address-stable buffer laid out as [hash(32) | rlp-string(node)] so the
+    // existing 8-byte-prefix collision fallback (`fast_rlp_view(p + 32)`)
+    // works unchanged for these entries.
+    void populate_from_preimages(std::span<const ByteView> nodes);
 
     std::optional<ByteView> get_rlp(const bytes32& hash) const override {
         auto it = storage_.find(key8(hash));
@@ -84,6 +96,10 @@ class FlatNodeStore final : public NodeStore {
 private:
     std::unordered_map<uint64_t, NodeRef> storage_;
     std::vector<const uint8_t*> collisions_;
+    // Owned [hash(32) | rlp-string(node)] entries for preimage-populated
+    // nodes. std::deque: NodeRef/collisions_ hold raw pointers into entries,
+    // so element addresses must be stable across growth.
+    std::deque<Bytes> owned_;
 };
 
 }  // namespace silkworm::mpt
