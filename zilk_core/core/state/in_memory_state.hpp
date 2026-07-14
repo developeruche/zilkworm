@@ -81,7 +81,12 @@ class InMemoryState : public State {
     const Storage& storage() const { return storage_; }
 
     evmc::bytes32 account_storage_root(const evmc::address& address) const;
-  private:
+
+  protected:
+    // Protected (not private) so stateless read-through caches
+    // (WitnessState) can seed pre-state entries without going through
+    // update_account/update_storage, which would pollute the per-block
+    // change tracking that post-state root recomputation consumes.
 
     FlatHashMap<evmc::address, Account> accounts_;
 

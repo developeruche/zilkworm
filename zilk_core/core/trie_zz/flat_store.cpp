@@ -2,8 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "flat_store.hpp"
 
+#include <evmone_precompiles/keccak.hpp>  // ethash_keccak256 (mpt.hpp depends on it)
+#include <zilk_core/core/common/empty_hashes.hpp>
 #include <zilk_core/core/rlp/decode.hpp>
 #include <zilk_core/print.hpp>
+
+#include "mpt.hpp"  // keccak_bytes
 
 namespace silkworm::mpt {
 
@@ -61,6 +65,58 @@ void FlatNodeStore::populate_from_rlp(ByteView trie_rlp) {
         auto [it, inserted] = storage_.emplace(node_hash, NodeRef{hash_start, off_len});
         if (!inserted) [[unlikely]] {
             if (it->second.hash_ptr != nullptr) {
+                collisions_.push_back(it->second.hash_ptr);
+                it->second = {nullptr, 0};
+            }
+            collisions_.push_back(hash_start);
+        }
+    }
+}
+
+// Populate from raw node preimages (canonical stateless witness format):
+// keccak each node, own [hash | rlp-string(node)] so pointers stay valid and
+// the collision fallback (fast_rlp_view at hash+32) decodes the same way it
+// does for packed-format entries.
+void FlatNodeStore::populate_from_preimages(std::span<const ByteView> nodes) {
+    storage_.max_load_factor(4.0f);
+    storage_.reserve(storage_.size() + nodes.size());
+
+    for (const ByteView& node : nodes) {
+        if (node.empty()) continue;
+
+        const bytes32 hash = keccak_bytes(node);
+
+        // Entry: hash(32) || RLP string header || node bytes.
+        Bytes& entry = owned_.emplace_back();
+        entry.reserve(32 + 3 + node.size());
+        entry.append(hash.bytes, 32);
+        const size_t n = node.size();
+        if (n <= 55) {
+            entry.push_back(static_cast<uint8_t>(0x80 + n));
+        } else if (n <= 0xFF) {
+            entry.push_back(0xB8);
+            entry.push_back(static_cast<uint8_t>(n));
+        } else {
+            entry.push_back(0xB9);
+            entry.push_back(static_cast<uint8_t>(n >> 8));
+            entry.push_back(static_cast<uint8_t>(n & 0xFF));
+        }
+        const uint32_t payload_off = static_cast<uint32_t>(entry.size());  // node bytes start
+        entry.append(node.data(), node.size());
+
+        const uint8_t* hash_start = entry.data();
+        const uint64_t off_len =
+            (static_cast<uint64_t>(payload_off) << 32) | static_cast<uint32_t>(n);
+
+        auto [it, inserted] = storage_.emplace(key8(hash), NodeRef{hash_start, off_len});
+        if (!inserted) [[unlikely]] {
+            if (it->second.hash_ptr != nullptr) {
+                // First collision on this 8-byte prefix: demote the existing
+                // entry to the linear-scan list. Skip exact duplicates.
+                if (std::memcmp(it->second.hash_ptr, hash.bytes, 32) == 0) {
+                    owned_.pop_back();
+                    continue;
+                }
                 collisions_.push_back(it->second.hash_ptr);
                 it->second = {nullptr, 0};
             }
