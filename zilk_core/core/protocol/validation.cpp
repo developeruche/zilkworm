@@ -152,9 +152,22 @@ ValidationResult pre_validate_common_base(const Transaction& txn, evmc_revision 
         return ValidationResult::kUnsupportedTransactionType;
     }
 
-    const intx::uint128 g0{intrinsic_gas(txn, revision)};
+    const intx::uint128 g0{intrinsic_gas(txn, revision, txn.sender())};
     if (txn.gas_limit < g0) {
         return ValidationResult::kIntrinsicGas;
+    }
+    if (revision >= EVMC_AMSTERDAM) {
+        // EIP-7825 under Amsterdam: the cap binds the regular-gas dimension,
+        // so the intrinsic regular cost and the calldata floor must each fit
+        // under it; the transaction gas limit itself may exceed the cap (the
+        // excess seeds the state-gas reservoir).
+        const uint64_t floor{floor_cost(txn, revision, txn.sender())};
+        if (g0 > fee::amsterdam::kTxMaxGasLimit || floor > fee::amsterdam::kTxMaxGasLimit) {
+            return ValidationResult::kMaxTransactionGasLimitExceeded;
+        }
+        if (txn.gas_limit < floor) {
+            return ValidationResult::kFloorCost;
+        }
     }
 
     if (intx::count_significant_bytes(txn.maximum_gas_cost()) > 32) {
@@ -208,17 +221,22 @@ ValidationResult pre_validate_common_forks(const Transaction& txn, const evmc_re
                 return ValidationResult::kEmptyAuthorizations;
             }
         }
-        // EIP-7623
-        const auto floor_cost = protocol::floor_cost(txn);
-        if (txn.gas_limit < floor_cost) {
-            return ValidationResult::kFloorCost;
+        // EIP-7623 (the Amsterdam floor is checked with its own formula in
+        // pre_validate_common_base)
+        if (rev < EVMC_AMSTERDAM) {
+            const auto floor_cost = protocol::floor_cost(txn, rev);
+            if (txn.gas_limit < floor_cost) {
+                return ValidationResult::kFloorCost;
+            }
         }
     }
 
     if (rev >= EVMC_OSAKA) {
-        /// The maximum allowed gas limit for a transaction (EIP-7825).
+        /// The maximum allowed gas limit for a transaction (EIP-7825). From
+        /// Amsterdam the cap only bounds the regular-gas dimension (checked
+        /// in pre_validate_common_base); tx gas may exceed it.
         constexpr auto MAX_TX_GAS_LIMIT = 0x1000000;  // 2**24
-        if (txn.gas_limit > MAX_TX_GAS_LIMIT) {
+        if (rev < EVMC_AMSTERDAM && txn.gas_limit > MAX_TX_GAS_LIMIT) {
             return ValidationResult::kMaxTransactionGasLimitExceeded;
         }
         if (txn.blob_versioned_hashes.size() > 6) {
@@ -237,7 +255,7 @@ ValidationResult validate_call_funds(const Transaction& txn, const EVM& evm, con
     intx::uint512 required_funds = compute_call_cost(txn, effective_gas_price, evm);
     // EIP-7623 Increase calldata cost
     if (evm.revision() >= EVMC_PRAGUE) {
-        const auto floor_cost = protocol::floor_cost(txn);
+        const auto floor_cost = protocol::floor_cost(txn, evm.revision(), txn.sender());
         const intx::uint512 gas_limit = std::max(txn.gas_limit, floor_cost);
         required_funds = std::max(required_funds, gas_limit * effective_gas_price);
     }

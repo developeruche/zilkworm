@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "processor.hpp"
+#include <cstdio>
 #include <evmone/test/state/state.hpp>
 #include <evmone/test/state/system_contracts.hpp>
 #include <zilk_core/core/protocol/intrinsic_gas.hpp>
@@ -157,27 +158,62 @@ void ExecutionProcessor::execute_transaction(const Transaction& txn, Receipt& re
     }
 
     const auto rev = evm_.revision();
-    const auto g0 = protocol::intrinsic_gas(txn, rev);
-    if (g0 > 1000) {
-    }
+    const auto g0 = protocol::intrinsic_gas(txn, rev, txn.sender());
     // // SILKWORM_ASSERT(g0 <= INT64_MAX);  // true due to the precondition (transaction must be valid)
-    const auto execution_gas_limit = txn.gas_limit - static_cast<uint64_t>(g0);
+    uint64_t execution_gas_limit = txn.gas_limit - static_cast<uint64_t>(g0);
+
+    // Amsterdam (EIP-7825/8037): the cap binds only the regular dimension;
+    // gas above it seeds the state-gas reservoir.
+    int64_t state_gas_reservoir{0};
+    if (rev >= EVMC_AMSTERDAM) {
+        const uint64_t regular_budget{protocol::fee::amsterdam::kTxMaxGasLimit -
+                                      static_cast<uint64_t>(g0)};
+        if (execution_gas_limit > regular_budget) {
+            state_gas_reservoir = static_cast<int64_t>(execution_gas_limit - regular_budget);
+            execution_gas_limit = regular_budget;
+        }
+    }
 
     // // Execute transaction with evmone APIv2.
     // // This must be done before the Silkworm execution so that the state is unmodified.
     // // evmone will not modify the state itself: state is read-only and the state modifications
     // // are provided as the state diff in the returned receipt.
 
-    // // EIP-7623: Increase calldata cost
-    const int64_t floor_cost = rev >= EVMC_PRAGUE ? static_cast<int64_t>(protocol::floor_cost(txn)) : 0;
+    // EIP-7623 (Prague..) / EIP-7976 (Amsterdam): calldata floor
+    const int64_t floor_cost =
+        rev >= EVMC_PRAGUE ? static_cast<int64_t>(protocol::floor_cost(txn, rev, txn.sender())) : 0;
 
-    if (execution_gas_limit > 10000 || floor_cost > 120302) {
-    }
     auto evm1_receipt = evmone::state::transition(
-        evm1_state_view, evm1_block_, evm1_block_hashes, evm1_txn, rev, evm_.vm(), {.execution_gas_limit = static_cast<int64_t>(execution_gas_limit), .min_gas_cost = floor_cost});
+        evm1_state_view, evm1_block_, evm1_block_hashes, evm1_txn, rev, evm_.vm(),
+        {.execution_gas_limit = static_cast<int64_t>(execution_gas_limit),
+            .min_gas_cost = floor_cost,
+            .state_gas_reservoir = state_gas_reservoir});
 
     auto gas_used = static_cast<uint64_t>(evm1_receipt.gas_used);
     cumulative_gas_used_ += gas_used;
+
+#ifdef Z6M_NATIVE_DEBUG
+    std::fprintf(stderr,
+        "z6m: tx gas: g0=%llu exec_limit=%llu reservoir=%lld floor=%lld used=%llu "
+        "before_refund=%lld state=%lld status=%d\n",
+        static_cast<unsigned long long>(static_cast<uint64_t>(g0)),
+        static_cast<unsigned long long>(execution_gas_limit),
+        static_cast<long long>(state_gas_reservoir), static_cast<long long>(floor_cost),
+        static_cast<unsigned long long>(gas_used),
+        static_cast<long long>(evm1_receipt.gas_used_before_refund),
+        static_cast<long long>(evm1_receipt.state_gas_used), static_cast<int>(evm1_receipt.status));
+#endif
+    if (rev >= EVMC_AMSTERDAM) {
+        // EIP-7778: the block's regular dimension counts pre-refund gas with
+        // the state dimension carved out, floored by the calldata floor.
+        const auto state_gas = static_cast<uint64_t>(evm1_receipt.state_gas_used);
+        const auto before_refund = static_cast<uint64_t>(evm1_receipt.gas_used_before_refund);
+        const uint64_t regular =
+            std::max(before_refund > state_gas ? before_refund - state_gas : 0,
+                     static_cast<uint64_t>(floor_cost));
+        block_regular_gas_used_ += regular;
+        block_state_gas_used_ += state_gas;
+    }
 
     // Prepare the receipt using the result from evmone.
     receipt.type = txn.type;
@@ -416,8 +452,23 @@ ValidationResult ExecutionProcessor::execute_block_no_post_validation(std::vecto
     receipts.resize(block.transactions.size());
     auto receipt_it{receipts.begin()};
 
+    const uint64_t block_gas_limit{block.header.gas_limit};
     for (const auto& txn : block.transactions) {
-        const ValidationResult err{protocol::validate_transaction(txn, state_, available_gas())};
+        uint64_t gas_available{available_gas()};
+        if (rev >= EVMC_AMSTERDAM) {
+            // Both dimensions must fit (EELS check_transaction): the regular
+            // dimension compares against min(cap, tx gas), the state
+            // dimension against the full tx gas.
+            const uint64_t regular_available{block_gas_limit - block_regular_gas_used_};
+            const uint64_t state_available{block_gas_limit - block_state_gas_used_};
+            if (std::min<uint64_t>(protocol::fee::amsterdam::kTxMaxGasLimit, txn.gas_limit) >
+                    regular_available ||
+                txn.gas_limit > state_available) {
+                return ValidationResult::kBlockGasLimitExceeded;
+            }
+            gas_available = UINT64_MAX;  // dimension checks done above
+        }
+        const ValidationResult err{protocol::validate_transaction(txn, state_, gas_available)};
         if (err != ValidationResult::kOk) {
             return err;
         }
@@ -476,7 +527,12 @@ ValidationResult ExecutionProcessor::execute_block(std::vector<Receipt>& receipt
 
     const auto& header{evm_.block().header};
 
-    if (cumulative_gas_used_ != header.gas_used) {
+    if (evm_.revision() >= EVMC_AMSTERDAM) {
+        // EIP-7778/8037: header gas used is the max of the two dimensions.
+        if (std::max(block_regular_gas_used_, block_state_gas_used_) != header.gas_used) {
+            return ValidationResult::kWrongBlockGas;
+        }
+    } else if (cumulative_gas_used_ != header.gas_used) {
         return ValidationResult::kWrongBlockGas;
     }
 

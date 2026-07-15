@@ -19,11 +19,18 @@ namespace protocol {
     // Returns the intrinsic gas of a transaction.
     // Refer to g0 in Section 6.2 "Execution" of the Yellow Paper
     // and EIP-3860 "Limit and meter initcode".
-    intx::uint128 intrinsic_gas(const UnsignedTransaction& txn, evmc_revision rev) noexcept;
+    // From Amsterdam (EIP-2780 et al.) the intrinsic cost depends on the
+    // sender (self-transfers skip the recipient/value components), so the
+    // recovered sender must be supplied for rev >= EVMC_AMSTERDAM.
+    intx::uint128 intrinsic_gas(const UnsignedTransaction& txn, evmc_revision rev,
+                                const std::optional<evmc::address>& sender = std::nullopt) noexcept;
 
-    // Returns the floor cost (valid since Pectra)
-    // Refer to: EIP-7623: Increase calldata cost
-    uint64_t floor_cost(const UnsignedTransaction& txn) noexcept;
+    // Returns the floor cost (valid since Pectra).
+    // Refer to: EIP-7623 (Prague..Osaka) and EIP-7976 (Amsterdam: floor token
+    // cost 16, uniform calldata tokens, access-list floor tokens, anchored on
+    // the intrinsic regular base instead of TX_BASE alone).
+    uint64_t floor_cost(const UnsignedTransaction& txn, evmc_revision rev = EVMC_PRAGUE,
+                        const std::optional<evmc::address>& sender = std::nullopt) noexcept;
 
 }  // namespace protocol
 

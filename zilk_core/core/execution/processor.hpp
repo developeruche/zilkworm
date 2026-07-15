@@ -80,6 +80,10 @@ class ExecutionProcessor {
 
     //! Execute transactions using evmone APIv2 only and apply the result state diff to the state.
     bool evm1_v2_ = false;
+    // Amsterdam (EIP-7778/8037): per-dimension block gas accounting.
+    // header.gas_used must equal max(regular, state).
+    uint64_t block_regular_gas_used_{0};
+    uint64_t block_state_gas_used_{0};
 };
 
 }  // namespace silkworm

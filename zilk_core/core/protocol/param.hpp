@@ -30,6 +30,32 @@ namespace fee {
     inline constexpr uint64_t kTotalCostFloorPerToken{10};  // EIP-7623: Increase calldata cost
     inline constexpr uint64_t kPerEmptyAccountCost{25000};  // EIP-7702 Set EOA account code
 
+    // ── Amsterdam (EIP-2780/7708/7976/7981/8037/8038) ─────────────────────
+    namespace amsterdam {
+        inline constexpr uint64_t kTxBase{12'000};                // EIP-2780
+        inline constexpr uint64_t kTxValueCost{4'244};            // EIP-2780
+        inline constexpr uint64_t kTransferLogCost{1'756};        // EIP-7708
+        inline constexpr uint64_t kColdAccountAccess{3'000};      // EIP-8038
+        inline constexpr uint64_t kColdStorageAccess{3'000};      // EIP-8038
+        inline constexpr uint64_t kWarmAccess{100};
+        inline constexpr uint64_t kAccountWrite{8'000};
+        inline constexpr uint64_t kStorageWrite{10'000};
+        inline constexpr uint64_t kCreateAccess{kAccountWrite + kColdStorageAccess};  // 11'000
+        inline constexpr uint64_t kDataTokenStandard{4};
+        inline constexpr uint64_t kDataTokenFloor{16};            // EIP-7976
+        inline constexpr uint64_t kAccessListAddressFloorTokens{80};
+        inline constexpr uint64_t kAccessListStorageKeyFloorTokens{128};
+        // 101 * 16 + ecrecover 3000 + cold 3000 + 2 * warm 100 = 7'816
+        inline constexpr uint64_t kRegularPerAuthBase{101 * kDataTokenFloor + 3'000 + kColdAccountAccess + 2 * kWarmAccess};
+        // EIP-8037 state gas: bytes * 1530
+        inline constexpr uint64_t kCostPerStateByte{1'530};
+        inline constexpr uint64_t kStateGasNewAccount{120 * kCostPerStateByte};   // 183'600
+        inline constexpr uint64_t kStateGasStorageSet{64 * kCostPerStateByte};    //  97'920
+        inline constexpr uint64_t kStateGasAuthBase{23 * kCostPerStateByte};      //  35'190
+        // EIP-7825 cap binds only the regular-gas dimension in Amsterdam.
+        inline constexpr uint64_t kTxMaxGasLimit{16'777'216};
+    }  // namespace amsterdam
+
 }  // namespace fee
 
 inline constexpr uint64_t kMinGasLimit{5000};
