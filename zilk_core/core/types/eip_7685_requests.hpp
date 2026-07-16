@@ -21,7 +21,9 @@ using BLSSignature = std::array<uint8_t, kBLSSignatureLen>;
 enum class FlatRequestType : uint8_t {
     kDepositRequest = 0,
     kWithdrawalRequest = 1,
-    kConsolidationRequest = 2
+    kConsolidationRequest = 2,
+    kBuilderDepositRequest = 3,  // EIP-8282 (Amsterdam)
+    kBuilderExitRequest = 4      // EIP-8282 (Amsterdam)
 };
 
 struct FlatRequests {

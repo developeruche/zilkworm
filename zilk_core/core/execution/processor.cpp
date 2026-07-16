@@ -504,6 +504,8 @@ ValidationResult ExecutionProcessor::execute_block_no_post_validation(std::vecto
         static_assert(static_cast<uint8_t>(Requests::Type::deposit) == static_cast<uint8_t>(FlatRequestType::kDepositRequest));
         static_assert(static_cast<uint8_t>(Requests::Type::withdrawal) == static_cast<uint8_t>(FlatRequestType::kWithdrawalRequest));
         static_assert(static_cast<uint8_t>(Requests::Type::consolidation) == static_cast<uint8_t>(FlatRequestType::kConsolidationRequest));
+        static_assert(static_cast<uint8_t>(Requests::Type::builder_deposit) == static_cast<uint8_t>(FlatRequestType::kBuilderDepositRequest));
+        static_assert(static_cast<uint8_t>(Requests::Type::builder_exit) == static_cast<uint8_t>(FlatRequestType::kBuilderExitRequest));
         for (const auto& req : requests_result->requests) {
             const auto type = static_cast<FlatRequestType>(static_cast<uint8_t>(req.type()));
             flat_requests.add_request(type, Bytes{req.data()});
