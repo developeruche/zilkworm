@@ -111,6 +111,8 @@ ExecutionProcessor::ExecutionProcessor(const Block& block, protocol::RuleSet& ru
         .base_fee = static_cast<uint64_t>(block.header.base_fee_per_gas.value_or(0)),
         .excess_blob_gas = block.header.excess_blob_gas.value_or(0),
         .blob_base_fee = block.header.blob_gas_price(config).value_or(0),
+        // EIP-7843 (Amsterdam): SLOTNUM reads the beacon chain slot number.
+        .slot_number = block.header.slot_number.value_or(0),
     };
     for (const auto& o : block.ommers)
         evm1_block_.ommers.emplace_back(evmone::state::Ommer{o.beneficiary, static_cast<uint32_t>(block.header.number - o.number)});
