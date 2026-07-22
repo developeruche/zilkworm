@@ -2,6 +2,7 @@
 // Copyright 2025 The Original Silkworm Authors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <cstdlib>
 #include "evm.hpp"
 
 #include <algorithm>
@@ -52,7 +53,9 @@ EVM::EVM(const Block& block, IntraBlockState& state, const ChainConfig& config) 
       state_{state},
       config_{config},
       evm1_{new evmone::VM{}} {
-    // evm1_.set_option("trace", "1");
+    // Opt-in per-opcode gas trace to stderr for conformance debugging.
+    if (std::getenv("Z6M_EVM_TRACE") != nullptr)
+        evm1_.set_option("trace", "1");
 }
 
 EVM::~EVM() {
