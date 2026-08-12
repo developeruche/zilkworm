@@ -104,18 +104,23 @@ The envelope bytes are identical across runners; only the surrounding transport 
 
 ### Public output
 
-SP1 guest writes to public values:
+The SP1 hypercube guest writes a fixed 112-byte output to public values:
 
-```
-<u32 N> <u64 result_0> ... <u64 result_{N-1}>
-```
+| Offset | Size | Field             | Notes |
+|--------|------|-------------------|-------|
+| 0      | 8    | `gas_used`        | u64 LE; cumulative across bundles, or a sentinel (below). |
+| 8      | 32   | `pre_state_root`  | parent state root the proof starts from i.e. the validation anchor. |
+| 40     | 32   | `post_state_root` | state root of the (last) proven block. |
+| 72     | 32   | `block_hash`      | hash of the (last) proven block. |
+| 104    | 8    | `chain_id`        | u64 LE. |
 
-Each `result_i` is `cumulative_gas_used`, or a sentinel:
+`gas_used` stays at offset 0 so existing readers are unaffected; it carries a sentinel on the
+failure/empty paths:
 
 | Sentinel       | Value          | Meaning |
 |----------------|----------------|---------|
 | `kRunFailure`  | `UINT64_MAX`   | Failed. |
 | `kRunSkipped`  | `UINT64_MAX-1` | Skipped. |
 
-Native + QEMU translate the same sentinels into ctest exit codes:
-**1** = any failure, **2** = all skipped (ctest `SKIP_RETURN_CODE`), **0** = otherwise.
+The roots, block hash, and chain ID bind the proof to a concrete state transition. The SP1 hypercube host currently parses and logs them.
+

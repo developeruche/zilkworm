@@ -3,6 +3,7 @@
 
 use crate::ethproofs_client::{EthProofsConfig, EthproofsClient};
 use crate::stdin_builders::{build_stdin_from_eth_tests, build_stdin_from_mfbd};
+use alloy_primitives::B256;
 use alloy_provider::{Provider, ProviderBuilder};
 use eyre::{bail, Context, Result};
 use z6m_common::{fetch_block_and_witness, FetchOutcome, FetchRequest};
@@ -38,6 +39,31 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Guest-committed public values (see docs/architecture.md for encoding details).
+#[derive(Debug, Clone)]
+struct PublicValues {
+    gas_used: u64,
+    pre_state_root: B256,
+    post_state_root: B256,
+    block_hash: B256,
+    chain_id: u64,
+}
+
+impl PublicValues {
+    fn parse(pv: &[u8]) -> Result<Self> {
+        if pv.len() < 112 {
+            bail!("public values too short: {} bytes (expected >= 112)", pv.len());
+        }
+        Ok(Self {
+            gas_used: u64::from_le_bytes(pv[0..8].try_into().unwrap()),
+            pre_state_root: B256::from_slice(&pv[8..40]),
+            post_state_root: B256::from_slice(&pv[40..72]),
+            block_hash: B256::from_slice(&pv[72..104]),
+            chain_id: u64::from_le_bytes(pv[104..112].try_into().unwrap()),
+        })
+    }
 }
 
 // Dynamic prover enum to handle both CPU and CUDA provers
@@ -475,8 +501,9 @@ impl Z6mProverService {
         let proving_millis = start.elapsed().as_millis() as u64;
 
         match proof_result {
-            Ok(Ok((mut proof, cycle_count))) => {
-                let gas_used = proof.public_values.read::<u64>();
+            Ok(Ok((proof, cycle_count))) => {
+                let pv = PublicValues::parse(proof.public_values.as_slice());
+                let gas_used = pv.as_ref().map(|v| v.gas_used).unwrap_or(0);
 
                 println!(
                     "[{}] Successfully proved block {}, gas_used={}, cycles={}, proving_ms={}",
@@ -486,6 +513,14 @@ impl Z6mProverService {
                     cycle_count,
                     proving_millis
                 );
+                match &pv {
+                    Ok(v) => println!(
+                        "[{}]   public values: pre_root={} post_root={} block_hash={} chain_id={}",
+                        Self::format_timestamp(),
+                        v.pre_state_root, v.post_state_root, v.block_hash, v.chain_id
+                    ),
+                    Err(e) => warn!("block {}: public values parse failed: {}", opts.block_number, e),
+                }
 
                 let cfg = bincode::config::standard();
                 let mut fp = BufWriter::new(File::create(&proof_path)?);
@@ -557,7 +592,7 @@ impl Z6mProverService {
     #[allow(dead_code)]
     pub async fn verify_proof(&self, opts: VerifyOptions) -> Result<()> {
         let cfg = bincode::config::standard();
-        let mut proof: SP1ProofWithPublicValues = {
+        let proof: SP1ProofWithPublicValues = {
             let mut r = BufReader::new(File::open(&opts.proof_path)?);
             bincode::serde::decode_from_std_read(&mut r, cfg)?
         };
@@ -572,8 +607,11 @@ impl Z6mProverService {
             .verify(&proof, &vk)
             .wrap_err("failed to verify proof")?;
 
-        let gas_used = proof.public_values.read::<u64>();
-        info!("verification complete, gas_used={}", gas_used);
+        let pv = PublicValues::parse(proof.public_values.as_slice())?;
+        info!(
+            "verification complete, gas_used={} pre_root={} post_root={} block_hash={} chain_id={}",
+            pv.gas_used, pv.pre_state_root, pv.post_state_root, pv.block_hash, pv.chain_id
+        );
         Ok(())
     }
 

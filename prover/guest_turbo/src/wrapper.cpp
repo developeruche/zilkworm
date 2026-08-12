@@ -36,16 +36,17 @@ extern "C" uint64_t sample_run_wrapped(rust::Vec<uint8_t> envelope_vec)
     auto state_transition = silkworm::cmd::state_transition::StateTransition(view);
     auto msg = "state_transition object initialized input size: " + std::to_string(envelope_vec.size());
     sys_println(msg.c_str());
-    uint64_t res = state_transition.run();
+    const auto result = state_transition.run();
+    const uint64_t gas_used = result.gas_used;
 
     if (state_transition.failed())
     {
-        std::string done_msg = "[state_transition] FAILED, gas used: " + std::to_string(res);
+        std::string done_msg = "[state_transition] FAILED, gas used: " + std::to_string(gas_used);
         sys_println(done_msg.c_str());
-        return res;
+        return gas_used;
     }
 
-    std::string done_msg = "[state_transition] run successful, gas used: " + std::to_string(res);
+    std::string done_msg = "[state_transition] run successful, gas used: " + std::to_string(gas_used);
     sys_println(done_msg.c_str());
-    return res;
+    return gas_used;
 }

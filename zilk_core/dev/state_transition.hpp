@@ -21,6 +21,11 @@ class StateTransition {
   private:
     std::span<uint8_t> envelope_;
     bool failed_{false};
+    evmc::bytes32 pre_state_root_{};
+    evmc::bytes32 post_state_root_{};
+    evmc::bytes32 block_hash_{};
+    uint64_t chain_id_{0};
+    bool pre_root_set_{false};
 
   public:
     /// Sentinel values returned by the run entry points. Any other value is the gas_used.
@@ -32,7 +37,16 @@ class StateTransition {
     static evmc::address to_evmc_address(const std::string& address);
     std::unique_ptr<evmc::address> sender_to_address(const std::string& sender);
 
-    uint64_t run();
+    // Transition summary committed to the guest public values.
+    struct Result {
+        uint64_t gas_used{0};
+        evmc::bytes32 pre_state_root{};   // parent root the proof starts from (MPT validation anchor)
+        evmc::bytes32 post_state_root{};  // state root of the last proven block
+        evmc::bytes32 block_hash{};       // hash of the last proven block
+        uint64_t chain_id{0};
+    };
+
+    Result run();
 
     bool failed() const noexcept { return failed_; }
 

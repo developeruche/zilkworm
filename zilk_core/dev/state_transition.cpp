@@ -352,6 +352,7 @@ std::pair<uint64_t, bool> StateTransition::run_one_bundle(::zilkworm::FlatBundle
         failed_ = true;
         return {0, false};
     }
+    chain_id_ = cfg_it->second.chain_id;
     bundle.direct.set_multi_block(bundle.block_rlps.size() > 1);
     Blockchain blockchain{bundle.direct, cfg_it->second, bundle.genesis};
     uint64_t cumulative_gas = 0;
@@ -410,6 +411,9 @@ std::pair<uint64_t, bool> StateTransition::run_one_bundle(::zilkworm::FlatBundle
             failed_ = true;
             return {0, false};
         }
+        // Last validated block in the run is the committed post-state root / block hash.
+        post_state_root_ = block.header.state_root;
+        block_hash_ = block.header.hash();
         bundle.direct.insert_header(block.header);
         cumulative_gas += block.header.gas_used;
     }
@@ -598,6 +602,11 @@ bool StateTransition::check_root(DirectState& direct_state, BlockHeader& header,
 
     // acc_updates already sorted: merge of two sorted hash sequences.
     auto prev_root = direct_state.read_header(header.number - 1, header.parent_hash)->state_root;
+    // First check_root in the run anchors the whole transition: commit it as the pre-state root in the guest public values.
+    if (!pre_root_set_) {
+        pre_state_root_ = prev_root;
+        pre_root_set_ = true;
+    }
     mpt::GridMPT<true> acc_trie(direct_state, prev_root);
     auto new_root = acc_trie.calc_root_from_updates({acc_updates.data(), acc_updates.size()});
     sys_println(std::format("New Root: {}", to_hex(new_root)));
@@ -671,24 +680,34 @@ bool StateTransition::check_root_new_block(DirectState& direct_state,
     return ok;
 }
 
-uint64_t StateTransition::run() {
+StateTransition::Result StateTransition::run() {
+    uint64_t gas = kRunFailure;
     if (envelope_.size() < 4) [[unlikely]] {
         sys_println("ERROR: input envelope too small for magic");
         failed_ = true;
-        return kRunFailure;
+    } else {
+        uint32_t magic = 0;
+        std::memcpy(&magic, envelope_.data(), sizeof(uint32_t));
+        switch (magic) {
+            case ::zilkworm::kInputMagicEJSN:
+                gas = run_ejsn();
+                break;
+            case ::zilkworm::kInputMagicMFBD:
+                gas = run_mfbd();
+                break;
+            default:
+                sys_println("ERROR: unsupported input magic");
+                failed_ = true;
+                break;
+        }
     }
-    uint32_t magic = 0;
-    std::memcpy(&magic, envelope_.data(), sizeof(uint32_t));
-    switch (magic) {
-        case ::zilkworm::kInputMagicEJSN:
-            return run_ejsn();
-        case ::zilkworm::kInputMagicMFBD:
-            return run_mfbd();
-        default:
-            sys_println("ERROR: unsupported input magic");
-            failed_ = true;
-            return kRunFailure;
-    }
+    return Result{
+        .gas_used = gas,
+        .pre_state_root = pre_state_root_,
+        .post_state_root = post_state_root_,
+        .block_hash = block_hash_,
+        .chain_id = chain_id_,
+    };
 }
 
 uint64_t StateTransition::run_ejsn() {

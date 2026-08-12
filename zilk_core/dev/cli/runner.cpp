@@ -36,9 +36,10 @@ int run_json_test_file(const std::string& file_path) {
                 input_str.data(), input_str.size());
 
     auto state_transition = StateTransition(std::span<uint8_t>{envelope});
-    const uint64_t rc = state_transition.run();
-    if (rc == StateTransition::kRunFailure) return 1;
-    if (rc == StateTransition::kRunSkipped) return 2;
+    const auto result = state_transition.run();
+    const uint64_t gas_used = result.gas_used;
+    if (gas_used == StateTransition::kRunFailure) return 1;
+    if (gas_used == StateTransition::kRunSkipped) return 2;
     return 0;
 }
 
@@ -53,16 +54,17 @@ int run_flat_bundle_file(const std::string& file_path) {
         std::istreambuf_iterator<char>{});
 
     auto state_transition = StateTransition(std::span<uint8_t>{blob});
-    const uint64_t rc = state_transition.run();
-    if (rc == StateTransition::kRunFailure) {
+    const auto result = state_transition.run();
+    const uint64_t gas_used = result.gas_used;
+    if (gas_used == StateTransition::kRunFailure) {
         std::cout << "FAIL: " << file_path << "\n";
         return 1;
     }
-    if (rc == StateTransition::kRunSkipped) {
+    if (gas_used == StateTransition::kRunSkipped) {
         std::cout << "SKIP: " << file_path << "\n";
         return 2;
     }
-    std::cout << "Cumulative Gas Used: " << rc << "\n";
+    std::cout << "Cumulative Gas Used: " << gas_used << "\n";
     return 0;
 }
 
