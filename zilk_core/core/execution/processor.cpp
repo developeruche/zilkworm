@@ -45,6 +45,7 @@ ExecutionProcessor::ExecutionProcessor(const Block& block, protocol::RuleSet& ru
         .prev_randao = block.header.difficulty == 0 ? block.header.prev_randao : intx::be::store<evmone::state::bytes32>(intx::uint256{block.header.difficulty}),
         .parent_beacon_block_root = block.header.parent_beacon_block_root.value_or(evmc::bytes32{}),
         .base_fee = static_cast<uint64_t>(block.header.base_fee_per_gas.value_or(0)),
+        .chain_id = config.chain_id,
         .excess_blob_gas = block.header.excess_blob_gas.value_or(0),
         .blob_base_fee = block.header.blob_gas_price(config).value_or(0),
     };
@@ -82,21 +83,21 @@ void ExecutionProcessor::execute_transaction(const Transaction& txn, Receipt& re
         .sender = *txn.sender(),
         .to = txn.to,
         .value = txn.value,
-        // TODO: evmone APIv2 uses transaction's chain id for CHAINID instruction; should be config chain_id.
+        // The chain's id: evmone validates the EIP-7702 authorizations' chain id against it.
         .chain_id = config_.chain_id,
         .nonce = txn.nonce};
     for (const auto& [account, storage_keys] : txn.access_list)
         evm1_txn.access_list.emplace_back(account, storage_keys);
     for (const evmc::bytes32& h : txn.blob_versioned_hashes)
         evm1_txn.blob_hashes.emplace_back(h);
+    // evmone recovers the authority from the signature itself (EIP-7702).
     for (const auto& authorization : txn.authorizations) {
         evm1_txn.authorization_list.push_back({.chain_id = authorization.chain_id,
                                                .addr = authorization.address,
                                                .nonce = authorization.nonce,
-                                               .signer = authorization.recover_authority(txn),
+                                               .y_parity = authorization.y_parity,
                                                .r = authorization.r,
-                                               .s = authorization.s,
-                                               .v = authorization.y_parity});
+                                               .s = authorization.s});
     }
 
     const auto rev = revision();
@@ -180,9 +181,11 @@ ValidationResult ExecutionProcessor::execute_block(std::vector<Receipt>& receipt
 
         DirectStateView state_view{direct_};
         BlockHashes block_hashes{*this};
-        auto requests_result = evmone::state::system_call_block_end(
+        auto block_end_result = evmone::state::system_call_block_end(
             state_view, evm1_block_, block_hashes, rev, vm_);
-        if (!requests_result.has_value())
+        const auto* requests_result =
+            std::get_if<evmone::state::RequestsResult>(&block_end_result);
+        if (requests_result == nullptr)
             return ValidationResult::kRequestsProcessingFailure;
         apply_state_diff(requests_result->state_diff);
 

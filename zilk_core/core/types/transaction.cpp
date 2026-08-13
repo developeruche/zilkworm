@@ -16,41 +16,8 @@
 #include <zilk_core/core/types/evmc_bytes32.hpp>
 
 #include "y_parity_and_chain_id.hpp"
-#include "zilk_core/core/crypto/secp256k1n.hpp"
 
 namespace silkworm {
-
-std::optional<evmc::address> Authorization::recover_authority(const Transaction& txn) const {
-    if (chain_id != 0 && chain_id != txn.chain_id) {
-        return {};
-    }
-    if (r >= kSecp256k1n || s >= kSecp256k1n) {
-        return {};
-    }
-    if (s > kSecp256k1Halfn) {
-        return {};
-    }
-
-    if (y_parity > 1) {
-        return {};
-    }
-
-    Bytes rlp{};
-    rlp::encode_for_signing(rlp, *this);
-
-    ethash::hash256 hash{keccak256(rlp)};
-
-    uint8_t signature[kHashLength * 2 + 1];
-    intx::be::unsafe::store(signature, r);
-    intx::be::unsafe::store(signature + kHashLength, s);
-    intx::be::unsafe::store(signature + 2 * kHashLength, y_parity);
-
-    std::optional recovered_authority = evmc::address{};
-    if (!silkworm_recover_address(recovered_authority->bytes, hash.bytes, signature, y_parity)) {
-        recovered_authority = std::nullopt;
-    }
-    return recovered_authority;
-}
 
 intx::uint256 Authorization::v() const {
     return y_parity_and_chain_id_to_v(y_parity, chain_id);
@@ -122,22 +89,6 @@ namespace rlp {
         encode(to, authorization.y_parity);
         encode(to, authorization.r);
         encode(to, authorization.s);
-    }
-
-    void encode_for_signing(Bytes& to, const Authorization& authorization) {
-        Header header{.list = true};
-        header.payload_length = length(authorization.chain_id);
-        header.payload_length += kAddressLength + 1;  // address is kAddressLength and one byte for size prefix
-        header.payload_length += length(authorization.nonce);
-
-        // See: Eip-7720 Set EOA account code
-        constexpr unsigned char kMagic{0x05};
-
-        to.push_back(kMagic);
-        encode_header(to, header);
-        encode(to, authorization.chain_id);
-        encode(to, authorization.address);
-        encode(to, authorization.nonce);
     }
 
     DecodingResult decode(ByteView& from, AccessListEntry& to, Leftover mode) noexcept {

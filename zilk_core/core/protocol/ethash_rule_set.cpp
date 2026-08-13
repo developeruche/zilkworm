@@ -74,7 +74,7 @@ ValidationResult EthashRuleSet::finalize(DirectState& direct, const Block& block
 }
 
 static intx::uint256 block_reward_base(const evmc_revision rev) {
-    if (rev >= EVMC_CONSTANTINOPLE) {
+    if (rev >= EVMC_PETERSBURG) {
         return kBlockRewardConstantinople;
     }
     if (rev >= EVMC_BYZANTIUM) {
@@ -151,7 +151,7 @@ intx::uint256 EthashRuleSet::difficulty(
     } else if (config.muir_glacier_block.has_value() && block_num >= config.muir_glacier_block) {
         // EIP-2384: Muir Glacier Difficulty Bomb Delay
         bomb_delay = 9'000'000;
-    } else if (rev >= EVMC_CONSTANTINOPLE) {
+    } else if (rev >= EVMC_PETERSBURG) {
         // EIP-1234: Constantinople Difficulty Bomb Delay and Block Reward Adjustment
         bomb_delay = 5'000'000;
     } else if (rev >= EVMC_BYZANTIUM) {

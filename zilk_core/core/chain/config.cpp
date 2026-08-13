@@ -190,7 +190,9 @@ evmc_revision ChainConfig::revision(uint64_t block_num, uint64_t block_time) con
     if (berlin_block && block_num >= berlin_block) return EVMC_BERLIN;
     if (istanbul_block && block_num >= istanbul_block) return EVMC_ISTANBUL;
     if (petersburg_block && block_num >= petersburg_block) return EVMC_PETERSBURG;
-    if (constantinople_block && block_num >= constantinople_block) return EVMC_CONSTANTINOPLE;
+    // EVMC dropped the Constantinople revision (never active on Mainnet);
+    // Petersburg is its closest match (Constantinople minus EIP-1283).
+    if (constantinople_block && block_num >= constantinople_block) return EVMC_PETERSBURG;
     if (byzantium_block && block_num >= byzantium_block) return EVMC_BYZANTIUM;
     if (spurious_dragon_block && block_num >= spurious_dragon_block) return EVMC_SPURIOUS_DRAGON;
     if (tangerine_whistle_block && block_num >= tangerine_whistle_block) return EVMC_TANGERINE_WHISTLE;
