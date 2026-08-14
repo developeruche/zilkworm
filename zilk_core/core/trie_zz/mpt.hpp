@@ -234,6 +234,12 @@ class GridMPT {
     // hits a 32-byte hash ref absent from the node store (witness incomplete).
     unsigned missing_count_{0};
 
+#ifndef NDEBUG
+    // DEBUG-only flag for failure propagation throughout the GridMPT implementation.
+    // In RELEASE builds, soundness rests on the final new_root == state_root compare.
+    bool failed_{false};
+#endif
+
     LeafNode make_cur_leaf(ByteView value_rlp);
 
     // Shared by the constructor and reset(): if previous_root_hash is
@@ -267,6 +273,9 @@ class GridMPT {
         search_nib_cursor_ = 0;
         last_was_delete_ = false;
         missing_count_ = 0;
+#ifndef NDEBUG
+        failed_ = false;
+#endif
         prev_root_ = new_prev_root;
         grid_.clear();                  
         embedded_rlp_copies_.clear();   // keeps capacity
@@ -303,6 +312,12 @@ class GridMPT {
     static constexpr bool supports_deletion() noexcept { return DeletionEnabled; }
 
     unsigned missing_count() const noexcept { return missing_count_; }
+
+#ifndef NDEBUG
+    // DEBUG-only method exposing a single source of truth for success or failure.
+    bool failed() const noexcept { return failed_; }
+#endif
+
     unsigned cascade_delete(unsigned depth);
 };
 

@@ -5,6 +5,7 @@
 #include "state_transition.hpp"
 
 #include <bit>
+#include <cassert>
 #include <cstring>
 #include <format>
 #include <fstream>
@@ -584,6 +585,7 @@ bool StateTransition::check_root(DirectState& direct_state, BlockHeader& header,
             storage_trie.reset(storage_root);
             storage_root = storage_trie.calc_root_from_updates(
                 {storage_updates.data(), storage_updates.size()});
+            assert(!storage_trie.failed());  // debug-only: in release caught by root compare below
         }
 
         bool readonly = false;
@@ -617,6 +619,7 @@ bool StateTransition::check_root(DirectState& direct_state, BlockHeader& header,
     }
     mpt::GridMPT<true> acc_trie(direct_state, prev_root);
     auto new_root = acc_trie.calc_root_from_updates({acc_updates.data(), acc_updates.size()});
+    assert(!acc_trie.failed());  // debug-only: in release caught by root compare below
     sys_println(std::format("New Root: {}", to_hex(new_root)));
     const bool ok = (new_root == header.state_root);
     for (const auto& addr : direct_state.changed_addresses_journal()) {

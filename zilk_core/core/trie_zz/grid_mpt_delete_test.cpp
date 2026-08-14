@@ -137,6 +137,9 @@ void check_delete_all_then_insert(const Bytes32Map& pre, const Bytes32Map& post)
 
     CAPTURE(silkworm::to_hex(got), silkworm::to_hex(expected));
     CHECK(trie.missing_count() == 0);
+#ifndef NDEBUG
+    CHECK_FALSE(trie.failed());
+#endif
     REQUIRE(got == expected);
 }
 
