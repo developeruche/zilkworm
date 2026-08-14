@@ -91,8 +91,18 @@ if(BUILD_TESTING)
     zilk_core/core/trie_zz/grid_mpt_fold_orphan_test.cpp
     zilk_core/core/trie_zz/grid_mpt_unfold_test.cpp
     zilk_core/dev/cli/mphf_map_test.cpp
+    zilk_core/dev/cli/addr_hash_orphan_test.cpp
+    zilk_core/dev/cli/account_read_spoof_test.cpp
+    zilk_core/dev/cli/account_read_honest_test.cpp
   )
-  target_link_libraries(zilkworm.tests PRIVATE silkworm_core Catch2::Catch2WithMain)
+  # addr_hash_orphan_test drives StateTransition::run (silkworm_dev). ld64 resolves the
+  # silkworm_core<->types_zz archive cycle globally; --start-group is GNU-ld-only.
+  if(APPLE)
+    set(ZILK_TEST_LIBS silkworm_dev silkworm_core silkworm_types_zz)
+  else()
+    set(ZILK_TEST_LIBS -Wl,--start-group silkworm_dev silkworm_core silkworm_types_zz -Wl,--end-group)
+  endif()
+  target_link_libraries(zilkworm.tests PRIVATE ${ZILK_TEST_LIBS} Catch2::Catch2WithMain)
   include(Catch)
   catch_discover_tests(zilkworm.tests)
 endif()
