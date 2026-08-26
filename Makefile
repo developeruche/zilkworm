@@ -46,7 +46,7 @@ EEST_FIXTURES_DIR := $(FIXTURES_CACHE)/eest_stable/fixtures
 test-fixtures:
 	tools/test-fixtures.sh test-fixtures.json $(FIXTURES_CACHE)
 
-SELFTEST_JSON := $(EEST_FIXTURES_DIR)/blockchain_tests/static/state_tests/stExample/add11.json
+SELFTEST_JSON := $(EEST_FIXTURES_DIR)/blockchain_tests/for_osaka/ported_static/stExample/add11/add11.json
 SELFTEST_MFBD := build/selftest.mfbd
 
 selftest: z6m_prover z6m_eest_convert test-fixtures

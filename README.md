@@ -175,8 +175,8 @@ SP1_PROVER=cuda RUST_BACKTRACE=full RUST_LOG=info --prove --n 1 --file-name test
 
 ### Native build
 
-1. Download and unpack the latest stable [EEST release](https://github.com/ethereum/execution-spec-tests/releases).
-2. Configure and build the CMake project with the path to the blockchain tests of the EEST:
+1. Download and unpack the latest stable [EEST release](https://github.com/ethereum/execution-specs/releases) (`tests@<ver>`), or just `make test-fixtures` to fetch the pinned one.
+2. Compiles the C++ EVM natively and runs tests directly with CTest:
    ```bash
    cmake -B build/release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DTESTS_DIR=/path/to/fixtures/blockchain_tests
    cmake --build build/release

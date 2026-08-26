@@ -76,7 +76,10 @@ namespace {
     static const std::unordered_map<std::string_view, std::vector<ValidationResult>>& exception_map() {
         static const std::unordered_map<std::string_view, std::vector<ValidationResult>> m{
             // Transaction-level rejections (must fire in pre-validate / per-tx validate).
-            {"TransactionException.INTRINSIC_GAS_TOO_LOW",                  {ValidationResult::kIntrinsicGas}},
+            // evmone unifies both gates under INTRINSIC_GAS_TOO_LOW
+            // (`gas_limit < max(total_intrinsic, min_cost)`), so the umbrella category
+            // accepts either silkworm enum.
+            {"TransactionException.INTRINSIC_GAS_TOO_LOW",                  {ValidationResult::kIntrinsicGas, ValidationResult::kFloorCost}},
             {"TransactionException.INTRINSIC_GAS_BELOW_FLOOR_GAS_COST",     {ValidationResult::kFloorCost}},
             {"TransactionException.INSUFFICIENT_ACCOUNT_FUNDS",             {ValidationResult::kInsufficientFunds}},
             {"TransactionException.INSUFFICIENT_MAX_FEE_PER_GAS",           {ValidationResult::kMaxFeeLessThanBase}},
@@ -86,10 +89,17 @@ namespace {
             {"TransactionException.NONCE_MISMATCH_TOO_LOW",                 {ValidationResult::kWrongNonce}},
             {"TransactionException.PRIORITY_GREATER_THAN_MAX_FEE_PER_GAS",  {ValidationResult::kMaxPriorityFeeGreaterThanMax}},
             {"TransactionException.SENDER_NOT_EOA",                         {ValidationResult::kSenderNoEOA}},
+            {"TransactionException.INVALID_CHAINID",                        {ValidationResult::kWrongChainId}},
+            // Bad r/s reject at the pre-validate signature gate; a bad v or an
+            // over-32-byte r/s can't decode as a signature field, so the block
+            // fails RLP decode first — EEST classifies both as INVALID_SIGNATURE_VRS.
+            {"TransactionException.INVALID_SIGNATURE_VRS",                  {ValidationResult::kInvalidSignature, kPreInsertReject}},
             {"TransactionException.GAS_ALLOWANCE_EXCEEDED",                 {ValidationResult::kBlockGasLimitExceeded}},
             {"TransactionException.GAS_LIMIT_EXCEEDS_MAXIMUM",              {ValidationResult::kMaxTransactionGasLimitExceeded}},
             {"TransactionException.GASLIMIT_PRICE_PRODUCT_OVERFLOW",        {ValidationResult::kInsufficientFunds}},
             {"TransactionException.INITCODE_SIZE_EXCEEDED",                 {ValidationResult::kMaxInitCodeSizeExceeded}},
+            {"TransactionException.TYPE_1_TX_PRE_FORK",                     {ValidationResult::kUnsupportedTransactionType}},
+            {"TransactionException.TYPE_2_TX_PRE_FORK",                     {ValidationResult::kUnsupportedTransactionType}},
             {"TransactionException.TYPE_3_TX_PRE_FORK",                     {ValidationResult::kUnsupportedTransactionType}},
             {"TransactionException.TYPE_4_TX_PRE_FORK",                     {ValidationResult::kUnsupportedTransactionType}},
             {"TransactionException.TYPE_3_TX_ZERO_BLOBS",                   {ValidationResult::kNoBlobs}},

@@ -39,7 +39,7 @@ ValidationResult pre_validate_transaction(const Transaction& txn, const evmc_rev
     }
 
     if (!is_valid_signature(txn.r, txn.s, rev >= EVMC_HOMESTEAD)) {
-        // return ValidationResult::kInvalidSignature;
+        return ValidationResult::kInvalidSignature;
     }
 
     if (rev >= EVMC_LONDON) {

@@ -95,6 +95,14 @@ inline const std::map<std::string, ChainConfig> kNetworkConfig{
          .tangerine_whistle_block = 0,
          .rule_set_config = protocol::EthashConfig{.validate_seal = false},
      }},
+    // EEST tests@v20+ spelling of EIP150 (evmone #1576 followed the same rename).
+    {"TangerineWhistle",
+     {
+         .chain_id = 1,
+         .homestead_block = 0,
+         .tangerine_whistle_block = 0,
+         .rule_set_config = protocol::EthashConfig{.validate_seal = false},
+     }},
     {"HomesteadToEIP150At5",
      {
          .chain_id = 1,
@@ -103,6 +111,15 @@ inline const std::map<std::string, ChainConfig> kNetworkConfig{
          .rule_set_config = protocol::EthashConfig{.validate_seal = false},
      }},
     {"EIP158",
+     {
+         .chain_id = 1,
+         .homestead_block = 0,
+         .tangerine_whistle_block = 0,
+         .spurious_dragon_block = 0,
+         .rule_set_config = protocol::EthashConfig{.validate_seal = false},
+     }},
+    // EEST tests@v20+ spelling of EIP158.
+    {"SpuriousDragon",
      {
          .chain_id = 1,
          .homestead_block = 0,

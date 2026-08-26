@@ -114,10 +114,11 @@ Then `make sp1-benchmark-corpus` to convert the new `.bin` into the corpus.
 ### 4.1 Source
 `test-fixtures.json` — erigon-style manifest pinning a fixture release tarball
 per corpus key (`url` + `sha256` + `size`). The `eest_stable` key points at an
-`ethereum/execution-spec-tests` release; `make test-fixtures` (i.e.
+`ethereum/execution-specs` release, published as `tests@<ver>` (fixture releases
+moved there from the retired `ethereum/execution-spec-tests`); `make test-fixtures` (i.e.
 `tools/test-fixtures.sh`) downloads, sha256-verifies and extracts it into
 `test-fixtures-cache/eest_stable/fixtures/` — `blockchain_tests/**/*.json`
-in per-fork dirs (`frontier/`, `paris/`, `osaka/`, …). Re-runs are no-ops
+in per-executed-fork dirs (`for_frontier/`, `for_osaka/`, …). Re-runs are no-ops
 while the pin matches (sentinel `.sha256` in the extracted dir).
 
 ### 4.2 Generate the MFBD tree (auto-keyed)
