@@ -71,6 +71,7 @@ add_library(
   evmone/lib/evmone_precompiles/secp256k1.cpp
   evmone/lib/evmone_precompiles/bls.cpp
   evmone/test/state/authorization.cpp
+  evmone/test/state/bal.cpp
   evmone/test/state/host.cpp
   evmone/test/state/precompiles.cpp
   evmone/test/state/state.cpp

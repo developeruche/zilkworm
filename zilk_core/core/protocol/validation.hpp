@@ -109,6 +109,10 @@ enum class [[nodiscard]] ValidationResult : int {
     // EIP-7825
     kMaxTransactionGasLimitExceeded,
 
+    // EIP-7928: Block-Level Access Lists
+    kBlockAccessListGasExceeded,   // BAL item count exceeds block.gas_limit / GAS_PER_ITEM
+    kBlockAccessListHashMismatch,  // computed BAL hash != header.block_access_list_hash
+
     // Bor validation errors. See https://github.com/erigontech/erigon/blob/main/consensus/bor/bor.go
     kMissingVanity,          // Block's extra-data section is shorter than 32 bytes, which is required to store the signer vanity
     kMissingSignature,       // Block's extra-data section doesn't seem to contain a 65 byte secp256k1 signature

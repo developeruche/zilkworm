@@ -4,8 +4,11 @@
 
 #include "validation.hpp"
 
+#include <algorithm>
 #include <bit>
 #include <cstring>
+
+#include <evmone/constants.hpp>
 
 #include <zilk_core/core/common/empty_hashes.hpp>
 #include <zilk_core/core/crypto/secp256k1n.hpp>
@@ -127,7 +130,24 @@ ValidationResult pre_validate_common_base(const Transaction& txn, evmc_revision 
         return ValidationResult::kUnsupportedTransactionType;
     }
 
-    const intx::uint128 g0{intrinsic_gas(txn, revision)};
+    // EIP-2780/8037 (Amsterdam): g0 is the regular-gas intrinsic only; the state-dependent
+    // charges are made at the top frame, not here.
+    intx::uint128 g0;
+    if (revision >= EVMC_AMSTERDAM) {
+        const auto cost = amsterdam_tx_gas_cost(txn);
+        // EIP-8037 transaction-validation condition 1: the reservoir model needs
+        // regular_gas_budget = TX_MAX_GAS_LIMIT - intrinsic_regular_gas to stay
+        // non-negative, so the regular intrinsic and the calldata floor are each
+        // capped at TX_MAX_GAS_LIMIT even though Amsterdam lifts the cap on
+        // txn.gas_limit itself. Mirrors evmone's validate_transaction.
+        constexpr int64_t kMaxTxGasLimit = 0x1000000;  // 2**24
+        if (std::max(cost.regular, cost.floor) > kMaxTxGasLimit) {
+            return ValidationResult::kIntrinsicGas;
+        }
+        g0 = static_cast<uint64_t>(cost.regular);
+    } else {
+        g0 = intrinsic_gas(txn, revision);
+    }
     if (txn.gas_limit < g0) {
         return ValidationResult::kIntrinsicGas;
     }
@@ -145,9 +165,13 @@ ValidationResult pre_validate_common_base(const Transaction& txn, evmc_revision 
 }
 
 ValidationResult pre_validate_common_forks(const Transaction& txn, const evmc_revision rev, const std::optional<intx::uint256>& blob_gas_price) noexcept {
-    // EIP-3860: Limit and meter initcode
+    // EIP-3860: Limit and meter initcode.
+    // EIP-7954 (Amsterdam): MAX_INITCODE_SIZE doubles to 2 * 0x10000.
+    // TODO(chfast): duplicate of evmone lib/evmone/constants.hpp.
     const bool contract_creation{!txn.to};
-    if (rev >= EVMC_SHANGHAI && contract_creation && txn.data.size() > kMaxInitCodeSize) {
+    const size_t max_initcode =
+        (rev >= EVMC_AMSTERDAM) ? size_t{evmone::MAX_INITCODE_SIZE_AMSTERDAM} : kMaxInitCodeSize;
+    if (rev >= EVMC_SHANGHAI && contract_creation && txn.data.size() > max_initcode) {
         return ValidationResult::kMaxInitCodeSizeExceeded;
     }
 
@@ -183,19 +207,24 @@ ValidationResult pre_validate_common_forks(const Transaction& txn, const evmc_re
                 return ValidationResult::kEmptyAuthorizations;
             }
         }
-        // EIP-7623
-        const auto floor_cost = protocol::floor_cost(txn);
-        if (txn.gas_limit < floor_cost) {
+        // EIP-7623 (Prague) / EIP-7976 + EIP-7981 (Amsterdam): revision-aware floor.
+        const auto floor = rev >= EVMC_AMSTERDAM
+                               ? static_cast<uint64_t>(amsterdam_tx_gas_cost(txn).floor)
+                               : protocol::floor_cost(txn);
+        if (txn.gas_limit < floor) {
             return ValidationResult::kFloorCost;
         }
     }
 
-    if (rev >= EVMC_OSAKA) {
+    // TODO(chfast): duplicate of evmone::state validation in state.cpp.
+    if (rev >= EVMC_OSAKA && rev < EVMC_AMSTERDAM) {
         /// The maximum allowed gas limit for a transaction (EIP-7825).
         constexpr auto MAX_TX_GAS_LIMIT = 0x1000000;  // 2**24
         if (txn.gas_limit > MAX_TX_GAS_LIMIT) {
             return ValidationResult::kMaxTransactionGasLimitExceeded;
         }
+    }
+    if (rev >= EVMC_OSAKA) {
         if (txn.blob_versioned_hashes.size() > 6) {
             return ValidationResult::kTooManyBlobs;
         }

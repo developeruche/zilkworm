@@ -4,6 +4,9 @@
 
 #include "processor.hpp"
 
+#include <algorithm>
+#include <variant>
+
 #include <evmone/evmone.h>
 #include <evmone/vm.hpp>
 #include <evmone/test/state/state.hpp>
@@ -48,6 +51,7 @@ ExecutionProcessor::ExecutionProcessor(const Block& block, protocol::RuleSet& ru
         .chain_id = config.chain_id,
         .excess_blob_gas = block.header.excess_blob_gas.value_or(0),
         .blob_base_fee = block.header.blob_gas_price(config).value_or(0),
+        .slot_number = block.header.slot_number.value_or(0),  // EIP-7843
     };
     for (const auto& o : block.ommers)
         evm1_block_.ommers.emplace_back(evmone::state::Ommer{o.beneficiary, static_cast<uint32_t>(block.header.number - o.number)});
@@ -101,17 +105,45 @@ void ExecutionProcessor::execute_transaction(const Transaction& txn, Receipt& re
     }
 
     const auto rev = revision();
-    const auto g0 = protocol::intrinsic_gas(txn, rev);
-    const auto execution_gas_limit = txn.gas_limit - static_cast<uint64_t>(g0);
 
-    // EIP-7623: Increase calldata cost
-    const int64_t floor_cost = rev >= EVMC_PRAGUE ? static_cast<int64_t>(protocol::floor_cost(txn)) : 0;
-    auto evm1_receipt = evmone::state::transition(
-        evm1_state_view, evm1_block_, evm1_block_hashes, evm1_txn, rev, vm_,
-        {.execution_gas_limit = static_cast<int64_t>(execution_gas_limit), .min_gas_cost = floor_cost});
+    // Amsterdam (EIP-2780/8037): g0 is regular gas only - every state-dependent
+    // charge moved to the top frame (EELS #3126). The EIP-7623 floor follows the
+    // EIP-7976/7981 token rules. evmone splits execution_gas_limit into the regular
+    // budget and the state-gas reservoir itself, from intrinsic_regular_gas.
+    evmone::state::TransactionProperties tx_props;
+    if (rev >= EVMC_AMSTERDAM) {
+        const auto cost = protocol::amsterdam_tx_gas_cost(txn);
+        tx_props = {.execution_gas_limit = static_cast<int64_t>(txn.gas_limit) - cost.regular,
+                    .intrinsic_regular_gas = cost.regular,
+                    .min_gas_cost = cost.floor};
+    } else {
+        const auto g0 = protocol::intrinsic_gas(txn, rev);
+        // EIP-7623: Increase calldata cost
+        const int64_t floor_cost =
+            rev >= EVMC_PRAGUE ? static_cast<int64_t>(protocol::floor_cost(txn)) : 0;
+        tx_props = {.execution_gas_limit =
+                        static_cast<int64_t>(txn.gas_limit - static_cast<uint64_t>(g0)),
+                    .min_gas_cost = floor_cost};
+    }
+
+    // EIP-7928: record cold account/slot accesses in the block access list.
+    const evmone::state::BalStateView bal_view{evm1_state_view, bal_builder_};
+    const auto& exec_view = rev >= EVMC_AMSTERDAM
+                                ? static_cast<const evmone::state::StateView&>(bal_view)
+                                : evm1_state_view;
+    auto evm1_receipt =
+        evmone::state::transition(exec_view, evm1_block_, evm1_block_hashes, evm1_txn, rev, vm_, tx_props);
 
     const auto gas_used = static_cast<uint64_t>(evm1_receipt.gas_used);
     cumulative_gas_used_ += gas_used;
+    if (rev >= EVMC_AMSTERDAM) {
+        sum_regular_block_gas_ += evm1_receipt.regular_block_gas;
+        sum_state_block_gas_ += evm1_receipt.state_block_gas;
+        // record_diff needs the pre-state (unwrapped) view, before apply_state_diff below.
+        bal_builder_.record_diff(evmone::state::bal_tx_index::tx(tx_index_),
+                                 evm1_receipt.state_diff, evm1_state_view);
+    }
+    ++tx_index_;
 
     // Prepare the receipt using the result from evmone.
     receipt.type = txn.type;
@@ -127,6 +159,12 @@ void ExecutionProcessor::execute_transaction(const Transaction& txn, Receipt& re
 }
 
 uint64_t ExecutionProcessor::available_gas() const noexcept {
+    // EIP-7778/8037 (Amsterdam): the block gas consumed so far is the maximum
+    // of the two accounting dimensions.
+    if (sum_regular_block_gas_ != 0 || sum_state_block_gas_ != 0) {
+        const auto used = std::max(sum_regular_block_gas_, sum_state_block_gas_);
+        return block_.header.gas_limit - static_cast<uint64_t>(used);
+    }
     return block_.header.gas_limit - cumulative_gas_used_;
 }
 
@@ -142,8 +180,14 @@ ValidationResult ExecutionProcessor::execute_block(std::vector<Receipt>& receipt
     {
         DirectStateView state_view{direct_};
         BlockHashes block_hashes{*this};
+        const evmone::state::BalStateView bal_view{state_view, bal_builder_};
+        const auto& sys_view = rev >= EVMC_AMSTERDAM
+                                   ? static_cast<const evmone::state::StateView&>(bal_view)
+                                   : state_view;
         auto diff = evmone::state::system_call_block_start(
-            state_view, evm1_block_, block_hashes, rev, vm_);
+            sys_view, evm1_block_, block_hashes, rev, vm_);
+        if (rev >= EVMC_AMSTERDAM)
+            bal_builder_.record_diff(evmone::state::bal_tx_index::PRE_BLOCK, diff, state_view);
         apply_state_diff(diff);
     }
 
@@ -157,7 +201,22 @@ ValidationResult ExecutionProcessor::execute_block(std::vector<Receipt>& receipt
     auto receipt_it{receipts.begin()};
 
     for (const auto& txn : block_.transactions) {
-        const ValidationResult err{protocol::validate_transaction(txn, direct_, available_gas())};
+        if (rev >= EVMC_AMSTERDAM) {
+            // EIP-8037 "Transaction validation" rule 2: per-dimension worst-case
+            // inclusion check with bare tx.gas_limit (execution-specs#2892).
+            constexpr int64_t kTxMaxGasLimit = 0x1000000;  // 2**24, EIP-7825
+            const auto block_gas_limit = static_cast<int64_t>(block_.header.gas_limit);
+            const auto gas_limit = static_cast<int64_t>(txn.gas_limit);
+            if (std::min(kTxMaxGasLimit, gas_limit) > block_gas_limit - sum_regular_block_gas_ ||
+                gas_limit > block_gas_limit - sum_state_block_gas_) {
+                return ValidationResult::kBlockGasLimitExceeded;
+            }
+        }
+        // Amsterdam replaces the cumulative available-gas inclusion rule with the
+        // per-dimension check above, so the per-tx budget is the whole block.
+        const uint64_t gas_available =
+            rev >= EVMC_AMSTERDAM ? block_.header.gas_limit : available_gas();
+        const ValidationResult err{protocol::validate_transaction(txn, direct_, gas_available)};
         if (err != ValidationResult::kOk) {
             return err;
         }
@@ -181,18 +240,28 @@ ValidationResult ExecutionProcessor::execute_block(std::vector<Receipt>& receipt
 
         DirectStateView state_view{direct_};
         BlockHashes block_hashes{*this};
+        const evmone::state::BalStateView bal_view{state_view, bal_builder_};
+        const auto& sys_view = rev >= EVMC_AMSTERDAM
+                                   ? static_cast<const evmone::state::StateView&>(bal_view)
+                                   : state_view;
         auto block_end_result = evmone::state::system_call_block_end(
-            state_view, evm1_block_, block_hashes, rev, vm_);
-        const auto* requests_result =
-            std::get_if<evmone::state::RequestsResult>(&block_end_result);
+            sys_view, evm1_block_, block_hashes, rev, vm_);
+        const auto* requests_result = std::get_if<evmone::state::RequestsResult>(&block_end_result);
         if (requests_result == nullptr)
             return ValidationResult::kRequestsProcessingFailure;
+        if (rev >= EVMC_AMSTERDAM) {
+            bal_builder_.record_diff(
+                evmone::state::bal_tx_index::post_block(block_.transactions.size()),
+                requests_result->state_diff, state_view);
+        }
         apply_state_diff(requests_result->state_diff);
 
         using evmone::state::Requests;
         static_assert(static_cast<uint8_t>(Requests::Type::deposit) == static_cast<uint8_t>(FlatRequestType::kDepositRequest));
         static_assert(static_cast<uint8_t>(Requests::Type::withdrawal) == static_cast<uint8_t>(FlatRequestType::kWithdrawalRequest));
         static_assert(static_cast<uint8_t>(Requests::Type::consolidation) == static_cast<uint8_t>(FlatRequestType::kConsolidationRequest));
+        static_assert(static_cast<uint8_t>(Requests::Type::builder_deposit) == static_cast<uint8_t>(FlatRequestType::kBuilderDepositRequest));
+        static_assert(static_cast<uint8_t>(Requests::Type::builder_exit) == static_cast<uint8_t>(FlatRequestType::kBuilderExitRequest));
         for (const auto& req : requests_result->requests) {
             const auto type = static_cast<FlatRequestType>(static_cast<uint8_t>(req.type()));
             flat_requests.add_request(type, Bytes{req.data()});
@@ -202,18 +271,42 @@ ValidationResult ExecutionProcessor::execute_block(std::vector<Receipt>& receipt
             return ValidationResult::kRequestsRootMismatch;
     }
 
-    const auto finalization_result = rule_set_.finalize(direct_, block_, logs);
+    if (rev >= EVMC_AMSTERDAM) {
+        // Finalize via evmone so withdrawals and the EIP-161 sweep produce a
+        // StateDiff the BAL can record; rule_set_.finalize mutates DirectState
+        // in place and leaves nothing to record. Amsterdam is always
+        // post-merge, so the block reward is absent.
+        DirectStateView state_view{direct_};
+        const evmone::state::BalStateView bal_view{state_view, bal_builder_};
+        const auto fin_diff =
+            evmone::state::finalize(bal_view, rev, block_.header.beneficiary,
+                                    /*block_reward=*/std::nullopt, evm1_block_.ommers,
+                                    evm1_block_.withdrawals);
+        bal_builder_.record_diff(
+            evmone::state::bal_tx_index::post_block(block_.transactions.size()), fin_diff,
+            state_view);
+        apply_state_diff(fin_diff);
+    } else {
+        const auto finalization_result = rule_set_.finalize(direct_, block_, logs);
+        if (finalization_result != ValidationResult::kOk) {
+            if (rev >= EVMC_SPURIOUS_DRAGON) {
+                direct_.destruct_dead_among(direct_.touched());
+            }
+            return finalization_result;
+        }
+    }
     if (rev >= EVMC_SPURIOUS_DRAGON) {
         direct_.destruct_dead_among(direct_.touched());
     }
 
-    if (finalization_result != ValidationResult::kOk) {
-        return finalization_result;
-    }
-
     const auto& header{block_.header};
 
-    if (cumulative_gas_used_ != header.gas_used) {
+    // EIP-7778 (Amsterdam): header.gas_used commits to max(regular, state).
+    const uint64_t expected_gas_used =
+        rev >= EVMC_AMSTERDAM
+            ? static_cast<uint64_t>(std::max(sum_regular_block_gas_, sum_state_block_gas_))
+            : cumulative_gas_used_;
+    if (expected_gas_used != header.gas_used) {
         return ValidationResult::kWrongBlockGas;
     }
 
@@ -233,6 +326,17 @@ ValidationResult ExecutionProcessor::execute_block(std::vector<Receipt>& receipt
     }
     if (bloom != header.logs_bloom) {
         return ValidationResult::kWrongLogsBloom;
+    }
+
+    // EIP-7928: validate the block-level access list commitment.
+    if (rev >= EVMC_AMSTERDAM) {
+        const auto bal = bal_builder_.build();
+        if (bal.exceeds_gas_limit(header.gas_limit)) {
+            return ValidationResult::kBlockAccessListGasExceeded;
+        }
+        if (bal.hash() != header.block_access_list_hash.value_or(evmc::bytes32{})) {
+            return ValidationResult::kBlockAccessListHashMismatch;
+        }
     }
 
     return ValidationResult::kOk;

@@ -25,6 +25,18 @@ namespace protocol {
     // Refer to: EIP-7623: Increase calldata cost
     uint64_t floor_cost(const UnsignedTransaction& txn) noexcept;
 
+    // Amsterdam (EIP-2780) resource-based intrinsic gas decomposition.
+    // Mirrors evmone's compute_tx_intrinsic_cost_amsterdam
+    // (third_party/evmone/test/state/state.cpp); the two must not drift.
+    // The intrinsic is regular-gas only: every state-dependent charge (the created
+    // account's NEW_ACCOUNT, the per-authorization NEW_ACCOUNT/AUTH_BASE) moved to
+    // the top frame with EIP-8037 (EELS #3126).
+    struct TxGasCost {
+        int64_t regular{0};  // regular-gas component of g0 (EIP-2780/8038)
+        int64_t floor{0};    // minimum gas cost (EIP-7623 floor per EIP-7976/7981)
+    };
+    TxGasCost amsterdam_tx_gas_cost(const Transaction& txn) noexcept;
+
 }  // namespace protocol
 
 }  // namespace silkworm

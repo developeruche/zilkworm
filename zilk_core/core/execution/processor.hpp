@@ -8,6 +8,7 @@
 #include <vector>
 
 #include <evmc/evmc.hpp>
+#include <evmone/test/state/bal.hpp>
 #include <evmone/test/state/block.hpp>
 #include <evmone/test/state/state_diff.hpp>
 #include <zilk_core/core/chain/config.hpp>
@@ -60,6 +61,12 @@ class ExecutionProcessor {
     ValidationResult execute_block_no_post_validation(std::vector<Receipt>& receipts) noexcept;
 
     uint64_t cumulative_gas_used_{0};
+    // EIP-7778/8037 (Amsterdam): per-dimension block gas accounting.
+    int64_t sum_regular_block_gas_{0};
+    int64_t sum_state_block_gas_{0};
+    // EIP-7928 (Amsterdam): block-level access list under construction.
+    evmone::state::BalBuilder bal_builder_{};
+    size_t tx_index_{0};
     DirectState& direct_;
     protocol::RuleSet& rule_set_;
     const Block& block_;

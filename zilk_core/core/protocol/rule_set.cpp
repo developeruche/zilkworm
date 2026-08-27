@@ -196,6 +196,22 @@ ValidationResult RuleSet::validate_block_header(const BlockHeader& header, const
         if (header.requests_hash) {
             return ValidationResult::kFieldBeforeFork;
         }
+    } else {
+        if (!header.requests_hash) {
+            return ValidationResult::kMissingField;
+        }
+    }
+
+    // EIP-7928 + EIP-7843 (Amsterdam): block_access_list_hash and slot_number
+    // are mandatory post-Amsterdam and forbidden pre-Amsterdam.
+    if (rev < EVMC_AMSTERDAM) {
+        if (header.block_access_list_hash || header.slot_number) {
+            return ValidationResult::kFieldBeforeFork;
+        }
+    } else {
+        if (!header.block_access_list_hash || !header.slot_number) {
+            return ValidationResult::kMissingField;
+        }
     }
     // return ValidationResult::kOk;
     return validate_difficulty_and_seal(header, *parent);

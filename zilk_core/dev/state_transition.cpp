@@ -13,6 +13,7 @@
 #include <new>
 #include <string_view>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -73,12 +74,11 @@ namespace {
     /// outside the mapped set, the test fails. This catches implementations
     /// that bypass the spec-required pre-validate gate and rely on an
     /// incidental post-execute check (state-root mismatch, gas-used mismatch).
-    static const std::unordered_map<std::string_view, std::vector<ValidationResult>>& exception_map() {
+    const std::unordered_map<std::string_view, std::vector<ValidationResult>>& exception_map() {
         static const std::unordered_map<std::string_view, std::vector<ValidationResult>> m{
             // Transaction-level rejections (must fire in pre-validate / per-tx validate).
-            // evmone unifies both gates under INTRINSIC_GAS_TOO_LOW
-            // (`gas_limit < max(total_intrinsic, min_cost)`), so the umbrella category
-            // accepts either silkworm enum.
+            // evmone unifies both gates under INTRINSIC_GAS_TOO_LOW (`gas_limit < max(total_intrinsic, min_cost)`),
+            // so the umbrella category accepts either silkworm enum.
             {"TransactionException.INTRINSIC_GAS_TOO_LOW",                  {ValidationResult::kIntrinsicGas, ValidationResult::kFloorCost}},
             {"TransactionException.INTRINSIC_GAS_BELOW_FLOOR_GAS_COST",     {ValidationResult::kFloorCost}},
             {"TransactionException.INSUFFICIENT_ACCOUNT_FUNDS",             {ValidationResult::kInsufficientFunds}},
@@ -89,17 +89,17 @@ namespace {
             {"TransactionException.NONCE_MISMATCH_TOO_LOW",                 {ValidationResult::kWrongNonce}},
             {"TransactionException.PRIORITY_GREATER_THAN_MAX_FEE_PER_GAS",  {ValidationResult::kMaxPriorityFeeGreaterThanMax}},
             {"TransactionException.SENDER_NOT_EOA",                         {ValidationResult::kSenderNoEOA}},
-            {"TransactionException.INVALID_CHAINID",                        {ValidationResult::kWrongChainId}},
+            {"TransactionException.INVALID_CHAINID",                        {ValidationResult::kWrongChainId, kPreInsertReject}},
             // Bad r/s reject at the pre-validate signature gate; a bad v or an
-            // over-32-byte r/s can't decode as a signature field, so the block
-            // fails RLP decode first — EEST classifies both as INVALID_SIGNATURE_VRS.
+            // over-32-byte r/s cannot decode as a signature field, so the block
+            // fails RLP decode first - EEST classifies both as INVALID_SIGNATURE_VRS.
             {"TransactionException.INVALID_SIGNATURE_VRS",                  {ValidationResult::kInvalidSignature, kPreInsertReject}},
             {"TransactionException.GAS_ALLOWANCE_EXCEEDED",                 {ValidationResult::kBlockGasLimitExceeded}},
             {"TransactionException.GAS_LIMIT_EXCEEDS_MAXIMUM",              {ValidationResult::kMaxTransactionGasLimitExceeded}},
-            {"TransactionException.GASLIMIT_PRICE_PRODUCT_OVERFLOW",        {ValidationResult::kInsufficientFunds}},
-            {"TransactionException.INITCODE_SIZE_EXCEEDED",                 {ValidationResult::kMaxInitCodeSizeExceeded}},
             {"TransactionException.TYPE_1_TX_PRE_FORK",                     {ValidationResult::kUnsupportedTransactionType}},
             {"TransactionException.TYPE_2_TX_PRE_FORK",                     {ValidationResult::kUnsupportedTransactionType}},
+            {"TransactionException.GASLIMIT_PRICE_PRODUCT_OVERFLOW",        {ValidationResult::kInsufficientFunds}},
+            {"TransactionException.INITCODE_SIZE_EXCEEDED",                 {ValidationResult::kMaxInitCodeSizeExceeded}},
             {"TransactionException.TYPE_3_TX_PRE_FORK",                     {ValidationResult::kUnsupportedTransactionType}},
             {"TransactionException.TYPE_4_TX_PRE_FORK",                     {ValidationResult::kUnsupportedTransactionType}},
             {"TransactionException.TYPE_3_TX_ZERO_BLOBS",                   {ValidationResult::kNoBlobs}},
@@ -123,7 +123,20 @@ namespace {
             {"BlockException.SYSTEM_CONTRACT_CALL_FAILED",                  {ValidationResult::kRequestsProcessingFailure}},
             {"BlockException.SYSTEM_CONTRACT_EMPTY",                        {ValidationResult::kRequestsProcessingFailure}},
             {"BlockException.INVALID_VERSIONED_HASHES",                     {ValidationResult::kWrongBlobCommitmentVersion}},
-            {"BlockException.INCORRECT_BLOCK_FORMAT",                       {ValidationResult::kFieldBeforeFork, ValidationResult::kMissingField, kPreInsertReject}},
+            // EIP-7928: malformed BAL bytes (wrong account order, duplicate account, etc.).
+            // evmone canonicalises (sort + dedup) when rebuilding; the resulting hash
+            // diverges from the header's, so silkworm reports kBlockAccessListHashMismatch
+            // via the same code path as semantic BAL violations.
+            // A post-fork header missing the BAL-hash field short-circuits in
+            // rlp::decode (the trailing optionals misparse) -> kPreInsertReject.
+            {"BlockException.INVALID_BAL_HASH",                             {ValidationResult::kBlockAccessListHashMismatch, kPreInsertReject}},
+            // Pre-fork header carrying post-fork fields: EEST names the resulting
+            // hash divergence INVALID_BLOCK_HASH; we reject it semantically.
+            {"BlockException.INVALID_BLOCK_HASH",                           {ValidationResult::kFieldBeforeFork, ValidationResult::kMissingField, kPreInsertReject}},
+            {"BlockException.INVALID_BLOCK_ACCESS_LIST",                    {ValidationResult::kBlockAccessListHashMismatch, ValidationResult::kBlockAccessListGasExceeded}},
+            {"BlockException.BLOCK_ACCESS_LIST_GAS_LIMIT_EXCEEDED",         {ValidationResult::kBlockAccessListGasExceeded}},
+            {"BlockException.INCORRECT_BLOCK_FORMAT",                       {ValidationResult::kFieldBeforeFork, ValidationResult::kMissingField, ValidationResult::kBlockAccessListHashMismatch, kPreInsertReject}},
+            {"BlockException.GAS_USED_OVERFLOW",                            {ValidationResult::kWrongBlockGas, ValidationResult::kBlockGasLimitExceeded}},
             // RLP-shape rejections short-circuit in rlp::decode / size check
             // before insert_block runs. Mark them with a sentinel so the runner
             // can match without consulting a ValidationResult.
@@ -139,7 +152,7 @@ namespace {
     /// still match); if no token resolves to a ValidationResult set containing
     /// @p got, the match fails — there is no permissive fallback, so an
     /// EEST fixture pinning a new exception string forces a map update.
-    static bool strict_exception_match(ValidationResult got, std::string_view expectation) {
+    bool strict_exception_match(ValidationResult got, std::string_view expectation) {
         if (expectation.empty()) return false;  // Empty expectation is never valid.
         const auto& m = exception_map();
         size_t pos = 0;
@@ -162,7 +175,7 @@ namespace {
     /// (RLP decode or oversized-block short-circuit): returns true iff at least
     /// one alternative in @p expectation resolves to a set containing
     /// @ref kPreInsertReject.
-    static bool strict_exception_match_pre_insert(std::string_view expectation) {
+    bool strict_exception_match_pre_insert(std::string_view expectation) {
         return strict_exception_match(kPreInsertReject, expectation);
     }
 
@@ -237,6 +250,10 @@ namespace {
         // Only after decode: the fork gate needs the block's number/timestamp.
         if (rlp->size() > kMaxRlpBlockSize && blockchain.config().revision(block.header.number, block.header.timestamp) >= EVMC_OSAKA) {
             if (invalid) {
+                if (!check_strict(std::nullopt)) {
+                    fail_strict("oversize-block");
+                    return Status::kFailed;
+                }
                 return Status::kPassed;
             }
             sys_println("Block exceeded kMaxRlpBlockSize");
@@ -252,8 +269,7 @@ namespace {
                 }
                 return Status::kPassed;
             }
-            (void)err;
-            sys_println("ERROR: validation error");
+            sys_println(std::format("ERROR: validation error {}", magic_enum::enum_name<ValidationResult>(err)).c_str());
             return Status::kFailed;
         }
 

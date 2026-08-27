@@ -181,6 +181,7 @@ bool ChainConfig::is_prague(BlockNum block_num, BlockTime block_time) const noex
 }
 
 evmc_revision ChainConfig::revision(uint64_t block_num, uint64_t block_time) const noexcept {
+    if (amsterdam_time && block_time >= amsterdam_time) return EVMC_AMSTERDAM;
     if (osaka_time && block_time >= osaka_time) return EVMC_OSAKA;
     if (prague_time && block_time >= prague_time) return EVMC_PRAGUE;
     if (cancun_time && block_time >= cancun_time) return EVMC_CANCUN;
@@ -202,6 +203,10 @@ evmc_revision ChainConfig::revision(uint64_t block_num, uint64_t block_time) con
 }
 
 BlobParams ChainConfig::blob_params(uint64_t block_time) const noexcept {
+    // TODO(chfast): duplicate of evmone::test::get_blob_params in test/utils/blob_schedule.cpp.
+    if (amsterdam_time && block_time >= amsterdam_time) {
+        return {14, 21, 11684671};
+    }
     if (bpo4_time && block_time >= bpo4_time) {
         return {14, 21, 13739630};
     }

@@ -103,6 +103,12 @@ namespace rlp {
         if (header.requests_hash) {
             rlp_head.payload_length += kHashLength + 1;
         }
+        if (header.block_access_list_hash) {
+            rlp_head.payload_length += kHashLength + 1;
+        }
+        if (header.slot_number) {
+            rlp_head.payload_length += length(*header.slot_number);
+        }
 
         return rlp_head;
     }
@@ -154,6 +160,12 @@ namespace rlp {
         }
         if (header.requests_hash) {
             encode(to, *header.requests_hash);
+        }
+        if (header.block_access_list_hash) {
+            encode(to, *header.block_access_list_hash);
+        }
+        if (header.slot_number) {
+            encode(to, *header.slot_number);
         }
     }
 
@@ -230,6 +242,24 @@ namespace rlp {
             }
         } else {
             to.requests_hash = std::nullopt;
+        }
+
+        if (from.size() > leftover) {
+            to.block_access_list_hash = evmc::bytes32{};
+            if (DecodingResult res{decode(from, *to.block_access_list_hash, Leftover::kAllow)}; !res) {
+                return res;
+            }
+        } else {
+            to.block_access_list_hash = std::nullopt;
+        }
+
+        if (from.size() > leftover) {
+            to.slot_number = 0;
+            if (DecodingResult res{decode(from, *to.slot_number, Leftover::kAllow)}; !res) {
+                return res;
+            }
+        } else {
+            to.slot_number = std::nullopt;
         }
 
         if (from.size() != leftover) {

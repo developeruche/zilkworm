@@ -84,6 +84,7 @@ struct ChainConfig {
     std::optional<BlockTime> bpo2_time{std::nullopt};
     std::optional<BlockTime> bpo3_time{std::nullopt};
     std::optional<BlockTime> bpo4_time{std::nullopt};
+    std::optional<BlockTime> amsterdam_time{std::nullopt};
 
     //! \brief Returns the config of the (pre-Merge) protocol rule set
     protocol::PreMergeRuleSetConfig rule_set_config{protocol::NoPreMergeConfig{}};
