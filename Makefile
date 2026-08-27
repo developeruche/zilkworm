@@ -41,7 +41,10 @@ execute-block: z6m_prover
 # `make test-fixtures` downloads, sha256-verifies and extracts every entry
 # into test-fixtures-cache/<key>/. Re-runs are no-ops while the pin matches.
 FIXTURES_CACHE := $(CURDIR)/test-fixtures-cache
-EEST_FIXTURES_DIR := $(FIXTURES_CACHE)/eest_stable/fixtures
+# Manifest key selecting which pinned corpus to run. Override to eest_devnet
+# to run the Glamsterdam devnet fixtures instead of the stable release.
+EEST_KEY ?= eest_stable
+EEST_FIXTURES_DIR := $(FIXTURES_CACHE)/$(EEST_KEY)/fixtures
 
 test-fixtures:
 	tools/test-fixtures.sh test-fixtures.json $(FIXTURES_CACHE)
@@ -75,7 +78,7 @@ z6m_eest_convert:
 # Content-addressed by the pinned tarball sha (test-fixtures.json) so
 # different pins coexist in test-fixtures-cache/mfbd-<sha>/. CI overrides
 # EEST_MFBD_DIR with a cache-keyed path.
-EEST_SHA := $(shell python3 -c "import json;print(json.load(open('test-fixtures.json'))['eest_stable']['sha256'][:12])" 2>/dev/null)
+EEST_SHA := $(shell python3 -c "import json;print(json.load(open('test-fixtures.json'))['$(EEST_KEY)']['sha256'][:12])" 2>/dev/null)
 EEST_MFBD_DIR ?= $(FIXTURES_CACHE)/mfbd-$(EEST_SHA)
 
 # Regenerate the MFBD corpus whenever it is missing OR the converter binary
@@ -90,6 +93,7 @@ eest-mfbd-build: z6m_eest_convert test-fixtures
 	    echo "  $(EEST_MFBD_DIR) up to date (converter $$conv_sha); skipping bulk-convert"; \
 	else \
 	    echo "  Regenerating MFBD corpus (converter $$conv_sha)"; \
+	    tools/test-fixtures.sh test-fixtures.json $(FIXTURES_CACHE) $(EEST_KEY); \
 	    rm -rf "$(EEST_MFBD_DIR)/blockchain_tests" "$(EEST_MFBD_DIR)/manifest.json"; \
 	    mkdir -p "$(EEST_MFBD_DIR)"; \
 	    $(EEST_CONVERT_BIN) bulk-convert \

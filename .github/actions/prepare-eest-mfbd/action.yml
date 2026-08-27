@@ -21,6 +21,10 @@ inputs:
   token:
     description: Unused (kept for call-site compatibility).
     required: false
+  manifest-key:
+    description: test-fixtures.json key selecting the corpus (eest_stable, eest_devnet, ...).
+    required: false
+    default: eest_stable
 
 outputs:
   dir:
@@ -38,7 +42,7 @@ runs:
       shell: bash
       run: |
         # The fixture pin comes from the manifest, no download required.
-        eest_sha=$(python3 -c "import json;print(json.load(open('test-fixtures.json'))['eest_stable']['sha256'][:12])")
+        eest_sha=$(python3 -c "import json;print(json.load(open('test-fixtures.json'))['${{ inputs.manifest-key }}']['sha256'][:12])")
         # The C++ converter is the MFBD producer; hash its source so any
         # change invalidates the cache.
         conv_sha=$(sha256sum \
@@ -59,20 +63,9 @@ runs:
     - name: Download EEST fixtures (cache miss only)
       if: steps.mfbd-cache.outputs.cache-hit != 'true'
       shell: bash
-      run: tools/test-fixtures.sh test-fixtures.json test-fixtures-cache eest_stable
+      run: tools/test-fixtures.sh test-fixtures.json test-fixtures-cache ${{ inputs.manifest-key }}
 
     - name: Build + run converter (cache miss only)
       if: steps.mfbd-cache.outputs.cache-hit != 'true'
       shell: bash
-      run: make eest-mfbd-build EEST_MFBD_DIR=${{ steps.cache-key.outputs.dir }}
-
-    # Save immediately after the converter so the cache survives even when a
-    # downstream test step fails. `actions/cache@v4`'s default post-step save
-    # only runs on full job success, which masked the cache as permanently
-    # missing while the eest pipeline was failing for other reasons.
-    - name: Save MFBD cache
-      if: steps.mfbd-cache.outputs.cache-hit != 'true'
-      uses: actions/cache/save@v4
-      with:
-        path: ${{ steps.cache-key.outputs.dir }}
-        key: ${{ steps.cache-key.outputs.key }}
+      run: make eest-mfbd-build EEST_KEY=${{ inputs.manifest-key }} EEST_MFBD_DIR=${{ steps.cache-key.outputs.dir }}
