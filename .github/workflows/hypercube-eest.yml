@@ -9,7 +9,7 @@ on:
       - 'prover/guest_hypercube/**'
       - 'prover/prover_hypercube/**'
       - 'zilk_core/core/**'
-      - 'third_party/evmone/lib/**'
+      - 'third_party/evmone'
   workflow_dispatch:
 
 jobs:
