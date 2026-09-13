@@ -60,9 +60,18 @@ add_executable(z6m_debug
 )
 
 target_include_directories(z6m_debug PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/include"
     "${Z6M_ROOT}/third_party/evmone/lib"
     "${Z6M_ROOT}/third_party/evmone/lib/evmone_precompiles"
 )
+
+# zilk_core/print.hpp routes sys_print()/sys_println() to semihosting only when
+# QEMU_DEBUG is set; zilk_core/CMakeLists.txt sets it for its own subtree, so it
+# has to be repeated here or these sources fall back to the host <iostream>
+# branch and clash with src/include/semihosting.hpp.
+if(QEMU_DEBUG)
+    target_compile_definitions(z6m_debug PRIVATE QEMU_DEBUG)
+endif()
 
 target_link_libraries(z6m_debug PRIVATE
     silkworm_dev silkworm_core evmone blst::blst

@@ -7,6 +7,7 @@
 #include <array>
 #include <span>
 #include <string>
+#include "include/cppextern.hpp"
 #include "include/semihosting.hpp"
 
 /* These magic symbols are provided by the linker.  */
@@ -18,6 +19,8 @@ extern void (*__fini_array_start[])(void);
 extern void (*__fini_array_end[])(void);
 
 extern "C" uint64_t sample_run_wrapped(std::string envelope_str) {
+    using silkworm::cmd::state_transition::StateTransition;
+
     // SP1's _start doesn't run global ctors.
     for (auto p = __preinit_array_start; p != __preinit_array_end; ++p) {
         (*p)();
@@ -31,9 +34,19 @@ extern "C" uint64_t sample_run_wrapped(std::string envelope_str) {
     std::span<uint8_t> env{
         reinterpret_cast<uint8_t*>(envelope_str.data()),
         envelope_str.size()};
-    auto state_transition = silkworm::cmd::state_transition::StateTransition(env);
-    uint64_t res = state_transition.run();
-    std::string msg = "[state_transition] run successful, gas used: " + std::to_string(res);
+    auto state_transition = StateTransition(env);
+    const uint64_t gas_used = state_transition.run().gas_used;
+
+    if (state_transition.failed() || gas_used == StateTransition::kRunFailure) {
+        sys_println("[state_transition] run FAILED");
+        return 1;
+    }
+    if (gas_used == StateTransition::kRunSkipped) {
+        sys_println("[state_transition] run SKIPPED");
+        return 2;
+    }
+
+    std::string msg = "[state_transition] run successful, gas used: " + std::to_string(gas_used);
     sys_println(msg.c_str());
-    return res;
+    return 0;
 }

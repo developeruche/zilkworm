@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <string>
+#include <utility>
 #include "./include/semihosting.hpp"
 #include <format>
 
@@ -40,8 +41,9 @@ int main(int /*argc*/, char* /*argv*/[])
     char buf[64];
     std::snprintf(buf, sizeof(buf), "Input envelope size: %zu", envelope_str.size());
     sys_println(buf);
-    const uint64_t res = sample_run_wrapped(envelope_str);
+    // ctest-compatible exit code: 0 = passed, 1 = failed, 2 = skipped.
+    const int exit_code = static_cast<int>(sample_run_wrapped(std::move(envelope_str)));
 
-    sys_println(std::format("Run complete. Result: {}", res));
-    sh::exit(static_cast<int>(res));
+    sys_println(std::format("Run complete. exit={}", exit_code));
+    sh::exit(exit_code);
 }
