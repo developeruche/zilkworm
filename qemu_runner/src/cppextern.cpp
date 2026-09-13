@@ -1,8 +1,13 @@
+// Copyright 2026 The Zilkworm Authors
+// SPDX-License-Identifier: Apache-2.0
+
 #include <zilk_core/dev/state_transition.hpp>
-// bn254_add.hpp
+#include <zilk_core/core/common/bytes.hpp>
 #include <cstdint>
 #include <array>
+#include <span>
 #include <string>
+#include "include/cppextern.hpp"
 #include "include/semihosting.hpp"
 
 /* These magic symbols are provided by the linker.  */
@@ -13,27 +18,10 @@ extern void (*__init_array_end[])(void);
 extern void (*__fini_array_start[])(void);
 extern void (*__fini_array_end[])(void);
 
-namespace {
-    uint64_t run_json_test(const std::string& json_str) {
-        const auto terminate_on_error = false;
-        const auto show_diagnostics = true;
-        auto state_transition = silkworm::cmd::state_transition::StateTransition(json_str, terminate_on_error, show_diagnostics);
-        return state_transition.run();
-    }
+extern "C" uint64_t sample_run_wrapped(std::string envelope_str) {
+    using silkworm::cmd::state_transition::StateTransition;
 
-    uint64_t run_unified_rlp(const std::string& unified_rlp_str) {
-        auto state_transition = silkworm::cmd::state_transition::StateTransition(unified_rlp_str);
-            // Run the state transition function of silkworm - EVMONE - silkworm_validate_transition and back
-            auto res = state_transition.run_rlp();
-        std::string msg = "[state_transition] run successful, gas used: " + std::to_string(res);
-        sys_println(msg.c_str());
-        return res;
-    }
-}
-
-extern "C" uint64_t sample_run_wrapped(bool is_test, std::string input_str) {
-
-    // Call global constructors because SP1's _start function doesn't.
+    // SP1's _start doesn't run global ctors.
     for (auto p = __preinit_array_start; p != __preinit_array_end; ++p) {
         (*p)();
     }
@@ -42,13 +30,23 @@ extern "C" uint64_t sample_run_wrapped(bool is_test, std::string input_str) {
     }
 
     sys_println("\nZilkworm guest initialized");
-    if (is_test) {
-        sys_println("\nRunning test input");
-        return run_json_test(input_str);
+
+    std::span<uint8_t> env{
+        reinterpret_cast<uint8_t*>(envelope_str.data()),
+        envelope_str.size()};
+    auto state_transition = StateTransition(env);
+    const uint64_t gas_used = state_transition.run().gas_used;
+
+    if (state_transition.failed() || gas_used == StateTransition::kRunFailure) {
+        sys_println("[state_transition] run FAILED");
+        return 1;
     }
-    else {
-        return run_unified_rlp(input_str);
+    if (gas_used == StateTransition::kRunSkipped) {
+        sys_println("[state_transition] run SKIPPED");
+        return 2;
     }
 
-    // Initialize a state_transition object with one Shanghai Transaction - within silkworm
+    std::string msg = "[state_transition] run successful, gas used: " + std::to_string(gas_used);
+    sys_println(msg.c_str());
+    return 0;
 }

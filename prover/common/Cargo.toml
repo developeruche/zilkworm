@@ -1,23 +1,36 @@
+# Copyright 2026 The Zilkworm Authors
+# SPDX-License-Identifier: Apache-2.0
+
 [package]
 name = "z6m_common"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["network"]
+# Everything needed by the prover.
+network = ["dep:alloy-consensus", "dep:alloy-provider", "dep:alloy-rpc-types",
+           "dep:alloy-rpc-types-debug", "dep:alloy-rlp", "dep:alloy-trie",
+           "dep:reqwest", "dep:tokio", "dep:url",
+           "dep:base64", "dep:tracing", "dep:rsp-mpt"]
+
 [dependencies]
-alloy-consensus = "1.0"
-alloy-eips = "1.0"
-alloy-primitives = "1.0"
-alloy-provider = { version = "1.0", features = ["debug-api"] }
-alloy-rlp = "0.3"
-alloy-rpc-types = "1.0"
-alloy-rpc-types-debug = "1.0"
-alloy-trie = "0.9"
+alloy-eips = { version = "1.0", features = ["serde"] }
+alloy-primitives = { version = "1.0", features = ["serde"] }
 eyre = "0.6"
-rsp-mpt = { git = "https://github.com/succinctlabs/rsp" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1", features = ["full"] }
-tracing = "0.1"
-url = "2.5"
-reqwest = { version = "0.12", features = ["json"] }
-base64 = "0.22"
+
+# Heavy / optional deps
+alloy-consensus = { version = "1.0", optional = true }
+alloy-provider = { version = "1.0", features = ["debug-api"], optional = true }
+alloy-rpc-types = { version = "1.0", optional = true }
+alloy-rpc-types-debug = { version = "1.0", optional = true }
+alloy-rlp = { version = "0.3", optional = true }
+alloy-trie = { version = "0.9", features = ["serde", "ethereum"], optional = true }
+reqwest = { version = "0.12", features = ["json"], optional = true }
+rsp-mpt = { git = "https://github.com/succinctlabs/rsp", optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+tracing = { version = "0.1", optional = true }
+url = { version = "2.5", optional = true }
+base64 = { version = "0.22", optional = true }

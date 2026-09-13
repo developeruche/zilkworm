@@ -1,4 +1,5 @@
-TESTS_DIR := third_party/eest-fixtures/blockchain_tests/prague
+# Copyright 2026 The Zilkworm Authors
+# SPDX-License-Identifier: Apache-2.0
 
 SHELL = /bin/bash
 .SHELLFLAGS = -o pipefail -c
@@ -13,7 +14,13 @@ else ifneq ($(XPACKS_LINUX),)
 export PATH := $(XPACKS_LINUX):$(PATH)
 endif
 
-.PHONY: z6m_guest z6m_prover selftest tests
+.PHONY: test-fixtures \
+        z6m_guest z6m_prover eest-prover-test z6m_eest_convert eest-blockchain-tests \
+        execute-block selftest tests eest-mfbd-build \
+        eest-blockchain-tests-json eest-prover-test-json tests-json \
+        sp1-benchmark-corpus sp1-benchmark derive_vk ere-bin \
+        ere-workload-checkout ere-fixtures ere-validate ere-compare \
+        release-artifacts
 
 clean: 
 	rm -rf prover/guest_hypercube/build/
@@ -26,7 +33,7 @@ z6m_guest:
 		-DSP1=ON
 	cmake --build prover/guest_hypercube/build -j$$(nproc)
 z6m_prover: z6m_guest
-	cargo build --release --manifest-path prover/prover_hypercube/Cargo.toml
+	cd prover && cargo build --release --manifest-path prover_hypercube/Cargo.toml
 
 test_hc: z6m_prover
 	prover/target/release/z6m_prover execute --block-number 23540896 --data-dir prover/prover_turbo/temp
@@ -36,30 +43,198 @@ z6m_guest_turbo:
 	(cd prover/guest_turbo && cargo prove build)
 
 z6m_prover_turbo: z6m_guest_turbo
-	cargo build --release --manifest-path prover/prover_turbo/Cargo.toml
-
-selftest: z6m_prover
-	prover/target/release/z6m_prover execute --is-test --file-name third_party/eest-fixtures/blockchain_tests/static/state_tests/stExample/add11.json
+	cd prover && cargo build --release --manifest-path prover_turbo/Cargo.toml
 
 execute-block: z6m_prover
 	prover/target/release/z6m_prover execute --file-name prover/temp/blocks/23519000/unifiedBlockAndStateRlp23519000.bin
 
-TESTFILES := $(shell find $(TESTS_DIR)/${TESTS_SUBDIR} -type f -name '*.json')
-RELTESTS := $(patsubst $(TESTS_DIR)/%,%,$(TESTFILES))
-LOGFILES := $(addprefix target/logs/,$(RELTESTS:.json=.log))
+# Pinned EEST fixture releases (test-fixtures.json, erigon-style manifest):
+# `make test-fixtures` downloads, sha256-verifies and extracts every entry
+# into test-fixtures-cache/<key>/. Re-runs are no-ops while the pin matches.
+FIXTURES_CACHE := $(CURDIR)/test-fixtures-cache
+# Manifest key selecting which pinned corpus to run. Override to eest_devnet
+# to run the Glamsterdam devnet fixtures instead of the stable release.
+EEST_KEY ?= eest_stable
+EEST_FIXTURES_DIR := $(FIXTURES_CACHE)/$(EEST_KEY)/fixtures
 
-tests: $(LOGFILES)
+test-fixtures:
+	tools/test-fixtures.sh test-fixtures.json $(FIXTURES_CACHE)
+
+SELFTEST_JSON := $(EEST_FIXTURES_DIR)/blockchain_tests/for_osaka/ported_static/stExample/add11/add11.json
+SELFTEST_MFBD := build/selftest.mfbd
+
+selftest: z6m_prover z6m_eest_convert test-fixtures
+	@mkdir -p $(dir $(SELFTEST_MFBD))
+	$(EEST_CONVERT_BIN) emit --json $(SELFTEST_JSON) --index 0 > $(SELFTEST_MFBD)
+	prover/target/release/z6m_prover execute --file-name $(SELFTEST_MFBD)
+
+TESTS_LOG_DIR := target/logs
+
+tests: z6m_prover eest-mfbd-build
+	@mkdir -p $(TESTS_LOG_DIR)/$(TESTS_SUBDIR)
+	prover/target/release/z6m_prover --test-service \
+		--test-dir $(EEST_MFBD_DIR)/$(TESTS_SUBDIR) \
+		--execution-log-dir $(TESTS_LOG_DIR)/$(TESTS_SUBDIR)
 
 .DELETE_ON_ERROR:
 
-target/logs/%.log: $(TESTS_DIR)/%.json
-	@mkdir -p $(dir $@)
-	prover/target/release/z6m_prover execute --is-test --file-name $< 2>&1 | tee $@ || (echo "CRASHED! $@" && rm $@)
+EEST_CONVERT_BIN := build/zilk_core/dev/cli/eest_to_flat_bundle
 
-eest-blockchain-tests: 
-	cmake -B build/eest -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DTESTS_DIR=third_party/eest-fixtures/blockchain_tests
+# Build the C++ eest_to_flat_bundle binary (emit / bulk-convert). Phony — cmake handles freshness.
+z6m_eest_convert:
+	cmake -DCMAKE_BUILD_TYPE=Release -B build -G Ninja -S .
+	cmake --build build --target eest_to_flat_bundle -j$$(nproc)
+
+# MFBD fixtures tree, produced by the C++ `eest_to_flat_bundle bulk-convert`.
+# Content-addressed by the pinned tarball sha (test-fixtures.json) so
+# different pins coexist in test-fixtures-cache/mfbd-<sha>/. CI overrides
+# EEST_MFBD_DIR with a cache-keyed path.
+EEST_SHA := $(shell python3 -c "import json;print(json.load(open('test-fixtures.json'))['$(EEST_KEY)']['sha256'][:12])" 2>/dev/null)
+EEST_MFBD_DIR ?= $(FIXTURES_CACHE)/mfbd-$(EEST_SHA)
+
+# Regenerate the MFBD corpus whenever it is missing OR the converter binary
+# changed. The binary hash covers every transitive source that affects the
+# output bytes (eest_to_flat_bundle.cpp, direct_state_builder.cpp, flat_bundle.*,
+# account.hpp, ...); ninja only relinks it when those change, so the hash is
+# stable across no-op runs and self-heals a stale corpus automatically.
+eest-mfbd-build: z6m_eest_convert test-fixtures
+	@conv_sha=$$(sha256sum "$(EEST_CONVERT_BIN)" | cut -c1-16); \
+	if [ -f "$(EEST_MFBD_DIR)/manifest.json" ] && \
+	   grep -q "\"converter_sha\": *\"$$conv_sha\"" "$(EEST_MFBD_DIR)/manifest.json"; then \
+	    echo "  $(EEST_MFBD_DIR) up to date (converter $$conv_sha); skipping bulk-convert"; \
+	else \
+	    echo "  Regenerating MFBD corpus (converter $$conv_sha)"; \
+	    tools/test-fixtures.sh test-fixtures.json $(FIXTURES_CACHE) $(EEST_KEY); \
+	    rm -rf "$(EEST_MFBD_DIR)/blockchain_tests" "$(EEST_MFBD_DIR)/manifest.json"; \
+	    mkdir -p "$(EEST_MFBD_DIR)"; \
+	    $(EEST_CONVERT_BIN) bulk-convert \
+	        --input-dir $(EEST_FIXTURES_DIR)/blockchain_tests \
+	        --output-dir "$(EEST_MFBD_DIR)/blockchain_tests"; \
+	    printf '{"eest_sha":"%s","converter_sha":"%s"}\n' "$(EEST_SHA)" "$$conv_sha" > "$(EEST_MFBD_DIR)/manifest.json"; \
+	fi
+
+eest-blockchain-tests: eest-mfbd-build
+	cmake -B build/eest -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
+		-DEEST_MFBD_DIR=$(EEST_MFBD_DIR)
 	cmake --build build/eest
 	ctest --test-dir build/eest --parallel
 
-rv32im-eest-blockchain-tests:
-	cd qemu_runner && make rv32im-eest-blockchain-tests
+eest-prover-test: z6m_prover eest-mfbd-build
+	prover/target/release/z6m_prover --test-service --test-dir $(EEST_MFBD_DIR)
+
+EEST_JSON_DIR ?= $(EEST_FIXTURES_DIR)/blockchain_tests
+
+eest-blockchain-tests-json:
+	cmake -B build/eest-json -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
+		-DEEST_JSON_DIR=$(EEST_JSON_DIR)
+	cmake --build build/eest-json
+	ctest --test-dir build/eest-json --parallel
+
+eest-prover-test-json: z6m_prover
+	prover/target/release/z6m_prover --test-service --test-dir $(EEST_JSON_DIR)
+
+tests-json: z6m_prover
+	@mkdir -p $(TESTS_LOG_DIR)/$(TESTS_SUBDIR)
+	prover/target/release/z6m_prover --test-service \
+		--test-dir $(EEST_JSON_DIR)/$(TESTS_SUBDIR) \
+		--execution-log-dir $(TESTS_LOG_DIR)/$(TESTS_SUBDIR)
+
+# SP1 benchmark corpus: flat MFBD bundles converted from the raw mainnet
+# witness blocks under $(BENCH_SRC_DIR)/<N>/unifiedBlockAndStateRlp<N>.bin.
+BENCH_CORPUS_DIR ?= temp/200_benchmark_blocks_mfbd_v2
+BENCH_SRC_DIR    ?= temp/200_benchmark_blocks
+
+# Rebuild the benchmark corpus by converting each raw witness block to MFBD
+# with the C++ legacy_to_flat_bundle CLI.
+sp1-benchmark-corpus:
+	cmake -DCMAKE_BUILD_TYPE=Release -B build -G Ninja -S .
+	cmake --build build --target legacy_to_flat_bundle -j$$(nproc)
+	@echo "  Regenerating SP1 benchmark corpus into $(BENCH_CORPUS_DIR)"
+	@for d in $(BENCH_SRC_DIR)/*/; do \
+		N=$$(basename $$d); \
+		src=$$d/unifiedBlockAndStateRlp$$N.bin; \
+		[ -f $$src ] || { echo "  skip $$N (no $$src)"; continue; }; \
+		mkdir -p $(BENCH_CORPUS_DIR)/$$N; \
+		build/zilk_core/dev/cli/legacy_to_flat_bundle $$src $(BENCH_CORPUS_DIR)/$$N/flatWitnessBundle$$N.mfbd; \
+	done
+	@echo "  SP1 benchmark corpus ready in $(BENCH_CORPUS_DIR)"
+
+# Run the SP1 benchmark. Regenerate the corpus and rebuild the prover first.
+sp1-benchmark: z6m_prover sp1-benchmark-corpus
+	python3 tools/scripts/sp1_benchmark.py --dir $(BENCH_CORPUS_DIR)
+
+# Stage release artifacts into ./temp/
+RELEASE_DIR := temp
+RELEASE_BINS := \
+	prover/guest_hypercube/build/z6m_guest.elf:z6m_guest_hypercube.elf \
+	prover/target/release/z6m_prover:z6m_prover_hypercube \
+	build/zilk_core/dev/cli/state_transition:state_transition_linux_x86_64
+
+release-artifacts:
+	@mkdir -p $(RELEASE_DIR)
+	@names=""; \
+	for pair in $(RELEASE_BINS); do \
+	    src=$${pair%%:*}; dst=$${pair##*:}; \
+	    if [ ! -f "$$src" ]; then echo "missing: $$src" >&2; exit 1; fi; \
+	    cp "$$src" "$(RELEASE_DIR)/$$dst"; \
+	    names="$$names $$dst"; \
+	done; \
+	(cd $(RELEASE_DIR) && sha256sum $$names > SHA256SUMS.txt)
+	@echo "release artifacts staged in $(RELEASE_DIR)/:"
+	@ls -l $(RELEASE_DIR)/z6m_guest_hypercube.elf $(RELEASE_DIR)/z6m_prover_hypercube $(RELEASE_DIR)/state_transition_linux_x86_64 $(RELEASE_DIR)/SHA256SUMS.txt
+	@echo "--- $(RELEASE_DIR)/SHA256SUMS.txt ---"
+	@cat $(RELEASE_DIR)/SHA256SUMS.txt
+# ERE benchmark integration: build the SP1 guest ELF + VK as expected by ere-hosts.
+ERE_BIN_DIR ?= $(CURDIR)/build/ere-bin
+ERE_GUEST_NAME ?= stateless-validator-zilkworm-sp1
+ERE_ELF := $(ERE_BIN_DIR)/$(ERE_GUEST_NAME).elf
+ERE_VK := $(ERE_BIN_DIR)/$(ERE_GUEST_NAME).vk
+DERIVE_VK_BIN := prover/target/release/derive_vk
+
+derive_vk:
+	cargo build --release -p z6m_stateless_validator --bin derive_vk --features vk-derive
+
+ere-bin: z6m_guest derive_vk
+	@mkdir -p $(ERE_BIN_DIR)
+	cp prover/guest_hypercube/build/z6m_guest.elf $(ERE_ELF)
+	SP1_PROVER=mock $(DERIVE_VK_BIN) $(ERE_ELF) $(ERE_VK)
+	@echo "ere-bin staged at $(ERE_BIN_DIR):"
+	@ls -la $(ERE_BIN_DIR)
+
+# ERE benchmark integration: validation/comparison.
+ERE_WORKLOAD_REPO   ?= https://github.com/eth-act/zkevm-benchmark-workload.git
+ERE_WORKLOAD_BRANCH ?= master
+ERE_WORKLOAD_DIR    ?= $(CURDIR)/temp/zkevm-benchmark-workload
+ERE_FIXTURE_FILTER  ?= 10M # scopes generation for tractable local runs. default: 10M-gas fixtures, i.e. the 1077-fixture subset
+ERE_TIMEOUT         ?= 60m
+ERE_FIXTURE_ENV     := EF_TEST_TRIE=default RUST_MIN_STACK=16388608 RUST_LOG=info
+ERE_RUN_ENV         := RUST_LOG=info
+
+ere-workload-checkout:
+	@if [ ! -d "$(ERE_WORKLOAD_DIR)/.git" ]; then \
+	    echo "cloning $(ERE_WORKLOAD_REPO) ($(ERE_WORKLOAD_BRANCH)) into $(ERE_WORKLOAD_DIR)"; \
+	    git clone --branch $(ERE_WORKLOAD_BRANCH) $(ERE_WORKLOAD_REPO) "$(ERE_WORKLOAD_DIR)"; \
+	else \
+	    echo "using existing workload checkout at $(ERE_WORKLOAD_DIR)"; \
+	fi
+
+ere-fixtures: ere-workload-checkout
+	cd "$(ERE_WORKLOAD_DIR)" && $(ERE_FIXTURE_ENV) \
+	    cargo run -p witness-generator-cli --release -- \
+	        tests $(if $(ERE_FIXTURE_FILTER),--include $(ERE_FIXTURE_FILTER))
+
+ere-validate: ere-fixtures
+	cd "$(ERE_WORKLOAD_DIR)" && $(ERE_RUN_ENV) \
+	    cargo run -p ere-hosts --release -- --zkvms sp1 --timeout $(ERE_TIMEOUT) \
+	        stateless-validator --execution-client zilkworm
+	python3 $(CURDIR)/tools/ere_compare.py --validate 'zilkworm-*' "$(ERE_WORKLOAD_DIR)/zkevm-metrics"
+
+ere-compare: ere-fixtures
+	cd "$(ERE_WORKLOAD_DIR)" && $(ERE_RUN_ENV) \
+	    cargo run -p ere-hosts --release -- --zkvms sp1 --timeout $(ERE_TIMEOUT) \
+	        stateless-validator --execution-client reth
+	cd "$(ERE_WORKLOAD_DIR)" && $(ERE_RUN_ENV) \
+	    cargo run -p ere-hosts --release -- --zkvms sp1 --timeout $(ERE_TIMEOUT) \
+	        stateless-validator --execution-client zilkworm
+	python3 $(CURDIR)/tools/ere_compare.py "$(ERE_WORKLOAD_DIR)/zkevm-metrics"
+

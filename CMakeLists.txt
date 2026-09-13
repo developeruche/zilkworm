@@ -1,13 +1,10 @@
 # Copyright 2025 Modifications: The Zilkworm Authors
 
-# Copyright 2025 The Silkworm Authors
+# Copyright 2026 The Zilkworm Authors (modifications)
+# Copyright 2025 The Original Silkworm Authors
 # SPDX-License-Identifier: Apache-2.0
 
 cmake_minimum_required(VERSION 3.28)
-
-if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/evmone/evmc/.git)
-  message(FATAL_ERROR "Git submodules not initialized, execute:\n  git submodule update --init --recursive")
-endif()
 
 # reduce the log verbosity of evmone/cmake/cable
 if(NOT CMAKE_MESSAGE_LOG_LEVEL)
@@ -33,29 +30,14 @@ if(NOT CMAKE_TOOLCHAIN_FILE)
 endif()
 
 project(zilkworm)
-set(PROJECT_VERSION 0.1.0-alpha.1)
+set(PROJECT_VERSION 0.1.0-alpha.2)
 
 include(CTest)
-include(CableBuildInfo)
 
 string(REGEX MATCH "([0-9]+)\\.([0-9]+)\\.([0-9]+)" _ ${PROJECT_VERSION})
 set(PROJECT_VERSION_MAJOR ${CMAKE_MATCH_1})
 set(PROJECT_VERSION_MINOR ${CMAKE_MATCH_2})
 set(PROJECT_VERSION_PATCH ${CMAKE_MATCH_3})
-
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-  set(CABLE_GIT_DESCRIBE "c0deadded1111111111111111111111111111111")
-  set(CABLE_GIT_BRANCH "dev")
-endif()
-
-cable_add_buildinfo_library(
-  PROJECT_NAME
-  "${PROJECT_NAME}"
-  GIT_DESCRIBE
-  "${CABLE_GIT_DESCRIBE}"
-  GIT_BRANCH
-  "${CABLE_GIT_BRANCH}"
-)
 
 option(SILKWORM_WASM_API "Build WebAssembly API" OFF)
 option(SILKWORM_CORE_ONLY "Only build Silkworm Core" OFF)
@@ -75,6 +57,20 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/compiler_settings.cmake)
 
 add_subdirectory(third_party)
 
+# Unit-test framework. Placed before compiler_warnings.cmake so Catch2
+# builds without the project's -Werror set.
+if(BUILD_TESTING)
+  include(FetchContent)
+  FetchContent_Declare(
+    Catch2
+    URL https://github.com/catchorg/Catch2/archive/refs/tags/v3.15.1.tar.gz
+    URL_HASH SHA256=be23a52b85cf04cd9587612147a10b023d59ed9757fa1843cc99e615d6c0893c
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+  )
+  FetchContent_MakeAvailable(Catch2)
+  list(APPEND CMAKE_MODULE_PATH "${catch2_SOURCE_DIR}/extras")
+endif()
+
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/compiler_warnings.cmake)
 
 if(SILKWORM_CLANG_TIDY)
@@ -84,6 +80,32 @@ if(SILKWORM_CLANG_TIDY)
 endif()
 
 add_subdirectory(zilk_core)
+
+# Aggregate Catch2 unit-test target. New *_test.cpp files join its source
+# list; each TEST_CASE is registered with ctest individually. Defined here
+# (not in zilk_core/) so projects embedding zilk_core with BUILD_TESTING=ON
+# but without Catch2 (qemu_runner) are unaffected.
+if(BUILD_TESTING)
+  add_executable(zilkworm.tests
+    zilk_core/core/trie_zz/grid_mpt_delete_test.cpp
+    zilk_core/core/trie_zz/grid_mpt_fold_orphan_test.cpp
+    zilk_core/core/trie_zz/grid_mpt_unfold_test.cpp
+    zilk_core/dev/cli/mphf_map_test.cpp
+    zilk_core/dev/cli/addr_hash_orphan_test.cpp
+    zilk_core/dev/cli/account_read_spoof_test.cpp
+    zilk_core/dev/cli/account_read_honest_test.cpp
+  )
+  # addr_hash_orphan_test drives StateTransition::run (silkworm_dev). ld64 resolves the
+  # silkworm_core<->types_zz archive cycle globally; --start-group is GNU-ld-only.
+  if(APPLE)
+    set(ZILK_TEST_LIBS silkworm_dev silkworm_core silkworm_types_zz)
+  else()
+    set(ZILK_TEST_LIBS -Wl,--start-group silkworm_dev silkworm_core silkworm_types_zz -Wl,--end-group)
+  endif()
+  target_link_libraries(zilkworm.tests PRIVATE ${ZILK_TEST_LIBS} Catch2::Catch2WithMain)
+  include(Catch)
+  catch_discover_tests(zilkworm.tests)
+endif()
 
 # All unit tests target
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/common/get_all_targets.cmake)

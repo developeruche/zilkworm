@@ -6,6 +6,8 @@ Instruction Set Architecture (ISA) based on RISC principles, standardized by [RI
 The architecture has three main layers: a **Rust prover host** that orchestrates proof generation, a **RISC-V guest program**
 that runs inside the zkVM, and a **C++ EVM core** that performs the actual block execution.
 
+(NOTE:  MULTI-BLOCK ONLY SUPPORTS EEST FULL-STATE MPT re-calculation with `silkworm::Hashbuildier` at the moment)
+
 ![Z6M Architecture Diagram](architecture.svg)
 
 ## Components
@@ -74,3 +76,51 @@ A fork of Silkworm's core, compiled both natively (for testing) and cross-compil
 3. **Execute**: The SP1 executor runs the guest ELF. The guest decodes the input, calls into zilk_core via FFI, and the C++ EVM executes every transaction in the block.
 4. **Prove**: The SP1 prover converts the execution trace into a succinct proof.
 5. **Verify**: The proof can be verified on-chain or off-chain using the SP1 verifying key.
+
+## Input Format
+
+Canonical byte layout fed as input to every Zilkworm STF runner (native, QEMU rv32/rv64,
+SP1 hypercube, and others). The first 4 bytes provide the magic identifier as follows
+
+| Magic    | Meaning |
+|----------|---------|
+| `MFBD`   | FlatBundle envelope: `<u32 "MFBD"><u32 ver><u64 N>` followed by N FlatBundle blobs (each 8-aligned). |
+| `EJSN`   | EEST JSON envelope: `<u32 "EJSN"><u32 ver>` followed by raw EEST `blockchain_test` JSON. |
+| `URLP`, `SFBD`, `STBD` | Reserved for UnifiedRLP, SingleFlatBundle, SingleTransactionBundle (no code path yet). |
+
+For the full FlatBundle / MFBD byte layout, see
+[`docs/flat_witness_bundle.md`](flat_witness_bundle.md)
+
+### Transport variants
+
+The envelope bytes are identical across runners; only the surrounding transport differs.
+
+| Runner             | Transport |
+|--------------------|-----------|
+| SP1 hypercube      | Envelope on SP1 stdin. |
+| Native `.mfbd`     | MFBD envelope in the file. |
+| Native `.json`     | EEST JSON file; the native runner wraps it with an `EJSN` header before invoking StateTransition. |
+| QEMU               | Envelope passed verbatim through the `stdin_payload.bin` file input |
+
+### Public output
+
+The SP1 hypercube guest writes a fixed 112-byte output to public values:
+
+| Offset | Size | Field             | Notes |
+|--------|------|-------------------|-------|
+| 0      | 8    | `gas_used`        | u64 LE; cumulative across bundles, or a sentinel (below). |
+| 8      | 32   | `pre_state_root`  | parent state root the proof starts from i.e. the validation anchor. |
+| 40     | 32   | `post_state_root` | state root of the (last) proven block. |
+| 72     | 32   | `block_hash`      | hash of the (last) proven block. |
+| 104    | 8    | `chain_id`        | u64 LE. |
+
+`gas_used` stays at offset 0 so existing readers are unaffected; it carries a sentinel on the
+failure/empty paths:
+
+| Sentinel       | Value          | Meaning |
+|----------------|----------------|---------|
+| `kRunFailure`  | `UINT64_MAX`   | Failed. |
+| `kRunSkipped`  | `UINT64_MAX-1` | Skipped. |
+
+The roots, block hash, and chain ID bind the proof to a concrete state transition. The SP1 hypercube host currently parses and logs them.
+

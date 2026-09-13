@@ -1,0 +1,53 @@
+name: Init submodules
+description: |
+  Initialize third_party submodules. Handles one quirk: evmc was inlined
+  into evmone (upstream PR #1499). Self-hosted runners may have stale evmc
+  submodule state from previous runs; deinit and remove internal metadata so
+  the next checkout can populate evmc/ as regular files.
+
+  EEST fixtures are no longer a submodule: they are pinned release tarballs
+  (test-fixtures.json) fetched by tools/test-fixtures.sh — see the
+  prepare-eest-mfbd action.
+
+inputs:
+  token:
+    description: GitHub token used to authenticate private submodule fetches.
+    required: true
+  extra-depth:
+    description: Shallow depth for submodules (empty = full).
+    required: false
+    default: "1"
+
+runs:
+  using: composite
+  steps:
+    - name: Init submodules
+      shell: bash
+      env:
+        TOKEN: ${{ inputs.token }}
+        DEPTH: ${{ inputs.extra-depth }}
+      run: |
+        set -euo pipefail
+        git config --global --add safe.directory '*'
+        git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+
+        # Clean up stale evmone/evmc submodule state (evmc was inlined into evmone).
+        # On self-hosted runners with a cached submodule checkout, git refuses to
+        # transition the submodule gitlink into a regular directory.
+        if [ -d third_party/evmone/.git ] || [ -f third_party/evmone/.git ]; then
+          git -C third_party/evmone submodule deinit -f evmc 2>/dev/null || true
+        fi
+        rm -rf third_party/evmone/evmc
+        rm -rf .git/modules/evmone/modules/evmc
+
+        depth_arg=""
+        if [ -n "$DEPTH" ]; then
+          depth_arg="--depth $DEPTH"
+        fi
+
+        git submodule update --init --recursive $depth_arg
+
+        # Restore evmc/ from evmone's HEAD. git submodule update is a no-op when
+        # HEAD already matches the target commit, so evmc/ files we deleted would
+        # not be re-materialized without this explicit checkout.
+        git -C third_party/evmone checkout HEAD -- evmc

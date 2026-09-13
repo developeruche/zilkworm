@@ -1,4 +1,5 @@
-// Copyright 2025 The Silkworm Authors
+// Copyright 2026 The Zilkworm Authors (modifications)
+// Copyright 2025 The Original Silkworm Authors
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
@@ -7,12 +8,13 @@
 #include <ostream>
 
 #include <zilk_core/core/chain/config.hpp>
-#include <zilk_core/core/execution/evm.hpp>
 #include <zilk_core/core/protocol/validation.hpp>
-#include <zilk_core/core/state/intra_block_state.hpp>
-#include <zilk_core/core/state/state.hpp>
+#include <zilk_core/core/state/block_state.hpp>
+#include <zilk_core/core/state_zz/direct_state.hpp>
 #include <zilk_core/core/types/block.hpp>
 #include <zilk_core/core/types/receipt.hpp>
+
+using ::zilkworm::DirectState;
 
 namespace silkworm::protocol {
 
@@ -26,7 +28,6 @@ struct BlockReward {
 std::ostream& operator<<(std::ostream& out, const BlockReward& reward);
 
 // Abstract class representing a set of protocol rules.
-// For example, its subclass BorRuleSet corresponds to the protocol rule set of Polygon PoS.
 class RuleSet {
   public:
     // Not copyable nor movable.
@@ -58,28 +59,18 @@ class RuleSet {
     virtual ValidationResult validate_ommers(const Block& block, const BlockState& state);
 
     //! \brief Initializes block execution by applying changes stipulated by the protocol
-    //! (e.g. storing parent beacon root)
-    virtual void initialize(EVM& evm) = 0;
+    //! (e.g. DAO transfer, storing parent beacon root)
+    virtual void initialize(const Block& block, DirectState& direct) = 0;
 
     //! \brief Finalizes block execution by applying changes stipulated by the protocol
     //! (e.g. block rewards, withdrawals)
-    //! \param [in] state: current state.
-    //! \param [in] block: current block to apply rewards for.
-    //! \remarks For Ethash See [YP] Section 11.3 "Reward Application".
-    virtual ValidationResult finalize(IntraBlockState& state, const Block& block, EVM& evm, const std::vector<Log>& logs) = 0;
+    virtual ValidationResult finalize(DirectState& direct, const Block& block,
+                                      const std::vector<Log>& logs) = 0;
 
     //! \brief See [YP] Section 11.3 "Reward Application".
-    //! \param [in] header: Current block to get beneficiary from
     virtual evmc::address get_beneficiary(const BlockHeader& header);
 
     virtual BlockReward compute_reward(const Block& block);
-
-    //! \brief Bor adds a transfer log after each transaction reflecting the gas fee transfer
-    virtual void add_fee_transfer_log(IntraBlockState& state, const intx::uint256& amount, const evmc::address& sender,
-                                      const intx::uint256& sender_initial_balance, const evmc::address& recipient,
-                                      const intx::uint256& recipient_initial_balance);
-
-    virtual TransferFunc* transfer_func() const { return standard_transfer; }
 
   protected:
     explicit RuleSet(const ChainConfig& chain_config, bool prohibit_ommers)

@@ -1,4 +1,5 @@
-// Copyright 2025 The Silkworm Authors
+// Copyright 2026 The Zilkworm Authors (modifications)
+// Copyright 2025 The Original Silkworm Authors
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
@@ -24,8 +25,6 @@ struct AccessListEntry {
     friend bool operator==(const AccessListEntry&, const AccessListEntry&) = default;
 };
 
-class Transaction;
-
 // EIP-7702 Authorization
 struct Authorization {
     intx::uint256 chain_id;
@@ -36,7 +35,6 @@ struct Authorization {
     intx::uint256 s;
 
     friend bool operator==(const Authorization&, const Authorization&) = default;
-    std::optional<evmc::address> recover_authority(const Transaction& txn) const;
     intx::uint256 v() const;
 };
 
@@ -206,7 +204,6 @@ namespace rlp {
 
     void encode(Bytes& to, const Authorization&);
     size_t length(const Authorization&);
-    void encode_for_signing(Bytes& to, const Authorization&);
 
     // According to EIP-2718, serialized transactions are prepended with 1 byte containing the type
     // (0x02 for EIP-1559 transactions); the same goes for receipts. This is true for signing and

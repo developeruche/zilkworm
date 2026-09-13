@@ -1,4 +1,5 @@
-// Copyright 2025 The Silkworm Authors
+// Copyright 2026 The Zilkworm Authors (modifications)
+// Copyright 2025 The Original Silkworm Authors
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
@@ -66,6 +67,7 @@ inline constexpr ChainConfig kPragueConfig{
 };
 
 inline const std::map<std::string, ChainConfig> kNetworkConfig{
+    {"Mainnet", kMainnetConfig},
     {"Frontier", test::kFrontierConfig},
     {"Homestead",
      {
@@ -93,6 +95,14 @@ inline const std::map<std::string, ChainConfig> kNetworkConfig{
          .tangerine_whistle_block = 0,
          .rule_set_config = protocol::EthashConfig{.validate_seal = false},
      }},
+    // EEST tests@v20+ spelling of EIP150 (evmone #1576 followed the same rename).
+    {"TangerineWhistle",
+     {
+         .chain_id = 1,
+         .homestead_block = 0,
+         .tangerine_whistle_block = 0,
+         .rule_set_config = protocol::EthashConfig{.validate_seal = false},
+     }},
     {"HomesteadToEIP150At5",
      {
          .chain_id = 1,
@@ -101,6 +111,15 @@ inline const std::map<std::string, ChainConfig> kNetworkConfig{
          .rule_set_config = protocol::EthashConfig{.validate_seal = false},
      }},
     {"EIP158",
+     {
+         .chain_id = 1,
+         .homestead_block = 0,
+         .tangerine_whistle_block = 0,
+         .spurious_dragon_block = 0,
+         .rule_set_config = protocol::EthashConfig{.validate_seal = false},
+     }},
+    // EEST tests@v20+ spelling of EIP158.
+    {"SpuriousDragon",
      {
          .chain_id = 1,
          .homestead_block = 0,
@@ -418,6 +437,25 @@ inline const std::map<std::string, ChainConfig> kNetworkConfig{
          .prague_time = 0,
          .osaka_time = 0,
      }},
+    {"Amsterdam",
+     {
+         .chain_id = 1,
+         .homestead_block = 0,
+         .tangerine_whistle_block = 0,
+         .spurious_dragon_block = 0,
+         .byzantium_block = 0,
+         .constantinople_block = 0,
+         .petersburg_block = 0,
+         .istanbul_block = 0,
+         .berlin_block = 0,
+         .london_block = 0,
+         .terminal_total_difficulty = 0,
+         .shanghai_time = 0,
+         .cancun_time = 0,
+         .prague_time = 0,
+         .osaka_time = 0,
+         .amsterdam_time = 0,
+     }},
     {"PragueToOsakaAtTime15k",
      {
          .chain_id = 1,
@@ -517,6 +555,27 @@ inline const std::map<std::string, ChainConfig> kNetworkConfig{
          .bpo2_time = 0,
          .bpo3_time = 0,
          .bpo4_time = 15'000,
+     }},
+    {"BPO2ToAmsterdamAtTime15k",
+     {
+         .chain_id = 1,
+         .homestead_block = 0,
+         .tangerine_whistle_block = 0,
+         .spurious_dragon_block = 0,
+         .byzantium_block = 0,
+         .constantinople_block = 0,
+         .petersburg_block = 0,
+         .istanbul_block = 0,
+         .berlin_block = 0,
+         .london_block = 0,
+         .terminal_total_difficulty = 0,
+         .shanghai_time = 0,
+         .cancun_time = 0,
+         .prague_time = 0,
+         .osaka_time = 0,
+         .bpo1_time = 0,
+         .bpo2_time = 0,
+         .amsterdam_time = 15'000,
      }},
 };
 

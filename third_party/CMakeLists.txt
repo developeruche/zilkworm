@@ -42,6 +42,8 @@ add_library(
   evmone/lib/evmone/baseline_instruction_table.hpp
   evmone/lib/evmone/baseline.hpp
   evmone/lib/evmone/constants.hpp
+  evmone/lib/evmone/create_address.cpp
+  evmone/lib/evmone/create_address.hpp
   evmone/lib/evmone/delegation.cpp
   evmone/lib/evmone/delegation.hpp
   evmone/lib/evmone_precompiles/secp256r1.cpp
@@ -61,11 +63,15 @@ add_library(
   evmone/lib/evmone_precompiles/ripemd160.cpp
   evmone/lib/evmone_precompiles/sha256.cpp
   evmone/lib/evmone_precompiles/modexp.cpp
+  evmone/lib/evmone_precompiles/mulmod.cpp
   evmone/lib/evmone_precompiles/kzg.cpp
+  evmone/lib/evmone_precompiles/kzg_precomputed_lines.cpp
   evmone/lib/evmone_precompiles/bn254.cpp
   evmone/lib/evmone_precompiles/pairing/bn254/pairing.cpp
   evmone/lib/evmone_precompiles/secp256k1.cpp
   evmone/lib/evmone_precompiles/bls.cpp
+  evmone/test/state/authorization.cpp
+  evmone/test/state/bal.cpp
   evmone/test/state/host.cpp
   evmone/test/state/precompiles.cpp
   evmone/test/state/state.cpp
@@ -76,7 +82,8 @@ target_include_directories(
   evmone
   PUBLIC evmone/include evmone/lib
   INTERFACE .
-  PRIVATE ..
+  # evmone's own root: its state library includes headers as <test/state/...>.
+  PRIVATE .. evmone
 )
 target_link_libraries(
   evmone
@@ -120,3 +127,6 @@ install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/evmone/lib/
   DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
   FILES_MATCHING PATTERN "*.h"
 )
+
+# EEST MFBD fixtures root. Populated by `make eest-mfbd-build` or by CI's cache + bulk-convert step.
+set(EEST_MFBD_DIR "" CACHE PATH "EEST MFBD fixtures root")

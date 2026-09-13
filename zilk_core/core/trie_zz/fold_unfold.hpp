@@ -7,6 +7,7 @@
 #include <cstring>
 #include <functional>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -16,10 +17,39 @@
 #include <zilk_core/core/common/empty_hashes.hpp>
 #include <zilk_core/core/common/util.hpp>
 #include <zilk_core/core/rlp/encode.hpp>
+#include <zilk_core/core/state_zz/direct_state.hpp>
 #include <zilk_core/print.hpp>
 
 #include "mpt.hpp"
 #include "rlp_sw.hpp"
+
+namespace zilkworm {
+
+// rlp helpers live in silkworm::rlp; alias for local readability.
+namespace rlp = ::silkworm::rlp;
+
+[[gnu::always_inline]] inline rlp::Header fast_decode_header(ByteView& from) noexcept {
+    if (from.size() < 8) [[unlikely]] {
+        return {false, from.size()};
+    }
+    uint64_t word;
+    std::memcpy(&word, from.data(), 8);
+    uint8_t first = word & 0xFF;
+
+    if (first < 0x80) return {false, 1};
+
+    bool is_list = first >= 0xC0;
+    uint8_t offset = first & 0x3Fu;
+
+    from.remove_prefix(1);
+    if (offset <= 55) return {is_list, offset};
+
+    size_t len_bytes = offset - 55;
+    size_t length = ((word >> 8) & 0xFF) << 16 | ((word >> 16) & 0xFF) << 8 | ((word >> 24) & 0xFF);
+    length >>= (8 * (3 - len_bytes));
+    from.remove_prefix(len_bytes);
+    return {is_list, length};
+}
 
 // Here lies an optimized code for stateless Merkle Patricia Trie
 // The core idea is processing nodes in a stack/grid where
@@ -27,46 +57,61 @@
 // The core idea is based on the fact that if updates are sorted
 // by keys, you never have to visit the left sub-tree at any height
 // of any branch once you are done processing that.
-namespace silkworm::mpt {
 
 // Decode an MPT node from its into a GridLine and push onto grid
 // Returns false on failure and true on success
 template <bool DeletionEnabled>
 bool GridMPT<DeletionEnabled>::unfold_node_from_rlp(ByteView payload, unsigned parent_slot_index, unsigned parent_depth) {
-    auto hh{rlp::decode_header(payload)};
-    if (!hh || !hh->list) [[unlikely]] {
-        sys_println(("ERROR: unfold_node_from_rlp Invalid Payload Header, parent_slot_index: " + std::to_string(parent_slot_index) + " parent_depth: " + std::to_string(parent_depth)).c_str());
+    // Use the inline fast_decode_header — every ext-child unfold and every
+    // direct unfold call lands here, so an out-of-line .cpp call would charge
+    // ~256 (3T+C) of jal/jalr per node read.
+    auto hh{fast_decode_header(payload)};
+    if (!hh.list) [[unlikely]] {
+#ifndef NDEBUG
+        failed_ = true;
+#endif
+        sys_println(("ERROR: unfold_node_from_rlp Invalid Payload Header, parent_slot_index: "
+            + std::to_string(parent_slot_index) 
+            + " parent_depth: " + std::to_string(parent_depth)).c_str());
         return false;
     }
-    auto list{payload.substr(0, hh->payload_length)};
+    auto list{payload.substr(0, hh.payload_length)};
 
-    // Try branch first: 17 concatenated items
-    // To distinguish: we need to attempt decoding as (17 strings). If it fails, try (2 items).
-    // A quick heuristic: count inner elements by walking; but we have a minimal reader—decode each shape directly.
-
-    // Try as branch:
-    {
-        BranchNode tmp{};
-        if (decode_branch(list, tmp)) {
-            return insert_line(parent_slot_index, parent_depth, std::move(tmp));
-        }
-    }
-    // Else extension/leaf:
     bool is_leaf = false;
     std::array<uint8_t, 64> path;
     uint8_t plen = 0;
     ByteView second{};
 
-    if (!decode_ext_or_leaf(list, is_leaf, path, plen, second)) return false;
+    GridLine* line_ptr = emplace_line(kBranch, parent_slot_index, parent_depth, 1u);
+    if (!line_ptr) [[unlikely]] return false;
+    GridLine& line = *line_ptr;
+
+    Kind kind = decode_node(list, line.branch, is_leaf, path, plen, second);
+    if (kind == kBranch) {
+        return true;
+    }
+    if (kind == kInvalid) [[unlikely]] {
+#ifndef NDEBUG
+        failed_ = true;
+#endif
+        pop_back();
+        return false;
+    }
     if (is_leaf) {
         LeafNode l{nibbles64{plen, path}, static_cast<uint8_t>(parent_slot_index), second};
-        insert_line(parent_slot_index, parent_depth, std::move(l));
+        transform_line(line, std::move(l));
     } else {
-        // For extensions: second contains either 32-byte hash or full RLP of embedded node
         ExtensionNode ext{nibbles64{plen, path}, {}};
+        // Reject an oversized child that would overflow child (a 32-byte bytes32).
+        if (second.size() > sizeof(ext.child.bytes)) {
+#ifndef NDEBUG
+            failed_ = true;
+#endif
+            return false;
+        }
         std::copy(second.cbegin(), second.cend(), ext.child.bytes);
         ext.child_len = static_cast<uint8_t>(second.size());
-        insert_line(parent_slot_index, parent_depth, std::move(ext));
+        transform_line(line, std::move(ext));
     }
     return true;
 }
@@ -85,7 +130,7 @@ void GridMPT<DeletionEnabled>::delete_leaf(unsigned depth) {
 
         // Compact easily if it's in the middle and shares parent with the last one
         if (depth != grid_.size() - 1 && grid_.back().parent_depth == grid_line.parent_depth) {
-            grid_line = grid_.back();
+            grid_line = grid_.back();  // TODO: Use smaller copy for leaf
             parent.child_depth[grid_line.parent_slot] = depth;
             depth = grid_.size() - 1;
         }
@@ -99,7 +144,7 @@ void GridMPT<DeletionEnabled>::pop_back() {
     depth_ = grid_.size() - 1;
 }
 
-// Soft are hard delete a line
+// Soft delete a line in the middle, hard-delete from the end
 template <bool DeletionEnabled>
 inline void GridMPT<DeletionEnabled>::delete_line(unsigned depth) {
     if (depth == grid_.size() - 1) {
@@ -108,46 +153,70 @@ inline void GridMPT<DeletionEnabled>::delete_line(unsigned depth) {
         grid_[depth].parent_depth = 0xff;
     }
 }
+template <bool DeletionEnabled>
+inline unsigned GridMPT<DeletionEnabled>::cascade_delete(unsigned depth) {
+    while (is_empty(grid_[depth])) {
+        auto& grid_line = grid_[depth];
+        if (grid_.size() > 1 && depth > 0) {
+            auto parent_depth = grid_line.parent_depth;
+            auto& parent = grid_[parent_depth];
+            switch (parent.kind) {
+                case kBranch:
+                    parent.branch.delete_child(grid_line.parent_slot);
+                    parent.child_depth[grid_line.parent_slot] = 0;  // clear
+                    parent.modified = true;
+                    break;
+                case kExt:
+                    parent.ext.delete_child();
+                    parent.child_depth[grid_line.parent_slot] = 0;  // clear
+                    parent.modified = true;
+                    break;
+                default:
+                    std::unreachable();
+            }
+            delete_line(depth);
+            depth = parent_depth;
+        } else {
+            delete_line(depth);
+            return 0;
+        }
+    }
+    return depth;
+}
 
 // Fold line at a given depth and make it phantom or deleted
 template <bool DeletionEnabled>
 inline void GridMPT<DeletionEnabled>::fold_line(unsigned depth) {
     auto& grid_line = grid_[depth];
-
     if (grid_line.parent_depth == 0xFF) {
-        grid_.pop_back();
-        return;  // Phantom line
+        grid_.pop_back();  // depth musth be at the end as otherwise already popped, see delete_line
+        return;            // Phantom line
     }
     if constexpr (DeletionEnabled) {
         if (is_empty(grid_line)) {
-            if (grid_.size() > 1) {
-                auto& parent = grid_[grid_line.parent_depth];
-                switch (parent.kind) {
-                    case kBranch:
-                        parent.branch.delete_child(grid_line.parent_slot);
-                        parent.child_depth[grid_line.parent_slot] = 0;  // clear
-                        break;
-                    case kExt:
-                        parent.ext.delete_child();
-                        parent.child_depth[grid_line.parent_slot] = 0;  // clear
-                        break;
-                    default:
-                        std::unreachable();
-                }
-            }
-            delete_line(depth);
+            cascade_delete(depth);
             return;
         }
         if (grid_line.kind == kBranch && grid_line.branch.has_single_child()) {  // Should get absorbed into an extension
             unsigned non_empty_nib = grid_line.branch.first_set_bit();
             depth_ = depth;
             // TODO optimize by checking it's a branch or not
-            unfold_slot(non_empty_nib);  // Needed because if it's a leaf this will get extended.
+            if (unfold_slot(non_empty_nib) != UnfoldResult::kSuccess) {  // Needed because if it's a leaf this will get extended.
+#ifndef NDEBUG
+                failed_ = true;
+#endif
+                sys_println("Error: fold_line unexpected error unfolding non_emtpy_nib");
+            }
             ExtensionNode ext{nibbles64{1, {static_cast<uint8_t>(non_empty_nib)}}};
             if (grid_.back().kind == kBranch) {
-                ext.child_len = grid_line.branch.child_len[non_empty_nib];
-                ext.set_child(ByteView{grid_line.branch.child[non_empty_nib].bytes, grid_line.branch.child_len[non_empty_nib]});
+                auto clen = grid_line.branch.child_len[non_empty_nib];
+                const uint8_t* src = (clen == 32 && grid_line.branch.child_ptr[non_empty_nib])
+                                         ? grid_line.branch.child_ptr[non_empty_nib]
+                                         : grid_line.branch.child[non_empty_nib].bytes;
+                ext.child_len = clen;
+                ext.set_child(ByteView{src, clen});
                 transform_line(grid_line, std::move(ext));
+                grid_line.modified = true;
                 grid_line.child_depth[non_empty_nib] = 0;
                 grid_.pop_back();
                 return;
@@ -167,6 +236,7 @@ inline void GridMPT<DeletionEnabled>::fold_line(unsigned depth) {
                 ExtensionNode ext{
                     nibbles64{1, {parent.branch.first_set_bit()}}};
                 transform_line(parent, std::move(ext));
+                parent.modified = true;
             }
 
             // ext -> ext = ext
@@ -175,6 +245,7 @@ inline void GridMPT<DeletionEnabled>::fold_line(unsigned depth) {
                 parent.ext.child = grid_line.ext.child;  // Todo only copy up to child_len
                 parent.ext.child_len = grid_line.ext.child_len;
                 parent.child_depth[grid_line.parent_slot] = 0;
+                parent.modified = true;
                 delete_line(depth);
                 return;
             }
@@ -186,10 +257,20 @@ inline void GridMPT<DeletionEnabled>::fold_line(unsigned depth) {
                 grid_line.leaf.path = new_path;
                 grid_line.leaf.parent_slot = parent.parent_slot;
                 transform_line(parent, std::move(grid_line.leaf));
+                parent.modified = true;
                 delete_line(depth);
                 return;
             }
         }
+    }
+
+    if (!grid_line.modified) {
+        if (grid_.size() > 1) {
+            // Clear parent's pointer; otherwise restructures follow a dangling depth.
+            grid_[grid_line.parent_depth].child_depth[grid_line.parent_slot] = 0;
+            delete_line(depth);
+        }
+        return;
     }
 
     const auto& encoded = encode_line(grid_line);
@@ -203,6 +284,7 @@ inline void GridMPT<DeletionEnabled>::fold_line(unsigned depth) {
     }
     if (grid_.size() > 1) {
         auto& parent = grid_[grid_line.parent_depth];
+        parent.modified = true;
         switch (parent.kind) {
             case kBranch:
                 parent.branch.set_child(grid_line.parent_slot, node_ref);
@@ -297,25 +379,36 @@ unsigned GridMPT<DeletionEnabled>::move_line(unsigned from_depth) {
 template <bool DeletionEnabled>
 template <typename NodeType>
 inline bool GridMPT<DeletionEnabled>::insert_line(unsigned parent_slot, unsigned parent_depth, NodeType&& node) {
-    if (parent_slot >= 16) return false;
-
+    Kind kind;
+    unsigned consumed;
     if constexpr (std::is_same_v<std::decay_t<NodeType>, LeafNode>) {
-        grid_.emplace_back(kLeaf, parent_slot, parent_depth, 0u);
-        grid_.back().leaf = std::forward<NodeType>(node);
+        kind = kLeaf;
+        consumed = 0u;
     } else if constexpr (std::is_same_v<std::decay_t<NodeType>, ExtensionNode>) {
-        grid_.emplace_back(kExt, parent_slot, parent_depth, node.path.len);
-        grid_.back().ext = std::forward<NodeType>(node);
+        kind = kExt;
+        consumed = node.path.len;  // read before the move below
     } else {  // BranchNode
-        grid_.emplace_back(kBranch, parent_slot, parent_depth, 1u);
-        grid_.back().branch = std::forward<NodeType>(node);
+        kind = kBranch;
+        consumed = 1u;
     }
-    depth_ = grid_.size() - 1;
-    // grid_.back().child_depth.fill(0);
+    GridLine* l = emplace_line(kind, parent_slot, parent_depth, consumed);
+    if (!l) return false;  // parent_slot out of range
+    if constexpr (std::is_same_v<std::decay_t<NodeType>, LeafNode>) {
+        l->leaf = std::forward<NodeType>(node);
+    } else if constexpr (std::is_same_v<std::decay_t<NodeType>, ExtensionNode>) {
+        l->ext = std::forward<NodeType>(node);
+    } else {  // BranchNode
+        l->branch = std::forward<NodeType>(node);
+    }
+    return true;
+}
 
-    if (depth_ > 0) {
+template <bool DeletionEnabled>
+inline void GridMPT<DeletionEnabled>::link_to_parent(GridLine& line, unsigned depth, unsigned parent_slot, unsigned parent_depth) {
+    if (depth > 0) {
         auto& parent = grid_[parent_depth];
-        grid_.back().consumed += parent.consumed;
-        parent.child_depth[parent_slot] = static_cast<uint8_t>(depth_);
+        line.consumed += parent.consumed;
+        parent.child_depth[parent_slot] = static_cast<uint8_t>(depth);
         if (parent.kind == kBranch && parent.branch.child_len[parent_slot] == 0) {
             parent.branch.mask |= 1 << parent_slot;
             parent.branch.child_len[parent_slot] = 1;  // Placeholder, update during fold_line
@@ -324,13 +417,32 @@ inline bool GridMPT<DeletionEnabled>::insert_line(unsigned parent_slot, unsigned
             parent.ext.child_len = 1;  // Placeholder, update during fold_line
         }
     }
-    return true;
 }
 
 template <bool DeletionEnabled>
+inline GridLine* GridMPT<DeletionEnabled>::emplace_line(Kind kind, unsigned parent_slot, unsigned parent_depth, unsigned consumed_init) {
+    if (parent_slot >= 16) {
+#ifndef NDEBUG
+        failed_ = true;
+#endif
+        return nullptr;
+    }
+    grid_.emplace_back(kind, parent_slot, parent_depth, consumed_init);
+    depth_ = grid_.size() - 1;
+    if (depth_ > 0) link_to_parent(grid_.back(), depth_, parent_slot, parent_depth);
+    return &grid_.back();
+}
+
+/// Create and insert a new line at the given target_depth
+template <bool DeletionEnabled>
 template <typename NodeType>
 inline bool GridMPT<DeletionEnabled>::insert_line_at(unsigned target_depth, unsigned parent_slot, unsigned parent_depth, NodeType&& node) {
-    if (parent_slot >= 16) return false;
+    if (parent_slot >= 16) {
+#ifndef NDEBUG
+        failed_ = true;
+#endif
+        return false;
+    }
 
     if (target_depth == grid_.size()) {
         // Same as insert_line — append to back
@@ -350,20 +462,7 @@ inline bool GridMPT<DeletionEnabled>::insert_line_at(unsigned target_depth, unsi
         line.branch = std::forward<NodeType>(node);
     }
     depth_ = target_depth;
-    line.child_depth.fill(0);
-
-    if (target_depth > 0) {
-        auto& parent = grid_[parent_depth];
-        line.consumed += parent.consumed;
-        parent.child_depth[parent_slot] = static_cast<uint8_t>(target_depth);
-        if (parent.kind == kBranch && parent.branch.child_len[parent_slot] == 0) {
-            parent.branch.mask |= 1 << parent_slot;
-            parent.branch.child_len[parent_slot] = 1;
-        }
-        if (parent.kind == kExt && parent.ext.child_len == 0) {
-            parent.ext.child_len = 1;
-        }
-    }
+    link_to_parent(line, target_depth, parent_slot, parent_depth);
     return true;
 }
 
@@ -390,14 +489,20 @@ inline bool GridMPT<DeletionEnabled>::transform_line(GridLine& line, NodeType&& 
         consumed = node.path.len;
         line.ext = std::move(node);
         if (consumed + parent_consumed > 255) {
-            sys_println(("{\"err\":\"cast_overflow\",\"consumed\":" + std::to_string(consumed) + ",\"parent_consumed\":" + std::to_string(parent_consumed) + "}").c_str());
+#ifndef NDEBUG
+            failed_ = true;
+#endif
+            sys_println("{\"err\":\"cast_overflow\"}");
         }
     } else {
         kind = kBranch;
         consumed = 1;
         line.branch = std::move(node);
         if (consumed + parent_consumed > 255) {
-            sys_println(("{\"err\":\"cast_overflow\",\"consumed\":" + std::to_string(consumed) + ",\"parent_consumed\":" + std::to_string(parent_consumed) + "}").c_str());
+#ifndef NDEBUG
+            failed_ = true;
+#endif
+            sys_println("{\"err\":\"cast_overflow\"}");
         }
     }
     line.consumed = static_cast<uint8_t>(consumed + parent_consumed);
@@ -405,45 +510,69 @@ inline bool GridMPT<DeletionEnabled>::transform_line(GridLine& line, NodeType&& 
     return true;
 }
 
-// Unfolds the node at the given slot of the branch at depth_,
-// returns false on error
+// Unfolds the node at the given slot of the branch at depth_
+// Returns kEmpty when the slot is empty - 0x80 (caller should insert here),
+// kMissing when a 32-byte hash ref has no entry in the node store
+// (witness incomplete — caller should hard-fail), kSuccess otherwise.
 template <bool DeletionEnabled>
-inline bool GridMPT<DeletionEnabled>::unfold_slot(unsigned slot) {
+inline UnfoldResult GridMPT<DeletionEnabled>::unfold_slot(unsigned slot) {
     if (slot > 15) [[unlikely]] {
+#ifndef NDEBUG
+        failed_ = true;
+#endif
         sys_println("{\"err\":\"slot > 15\"}");
-        return false;
+        return UnfoldResult::kUndefined;
     }
-    if (depth_ >= grid_.size()) {
-        sys_println(("{\"err\":\"depth >= grid_size\",\"depth\":" + std::to_string(depth_) + ",\"grid_size\":" + std::to_string(grid_.size()) + "}").c_str());
-        return false;
+    if (depth_ >= grid_.size()) [[unlikely]] {
+#ifndef NDEBUG
+        failed_ = true;
+#endif
+        sys_println("{\"err\":\"depth >= grid_size\"}");
+        return UnfoldResult::kUndefined;
     }
-    if (grid_[depth_].kind != kBranch) {
-        sys_println(("{\"err\":\"unfold_not_branch\",\"depth\":" + std::to_string(depth_) + ",\"kind\":" + std::to_string(grid_[depth_].kind) + "}").c_str());
-        return false;
+    if (grid_[depth_].kind != kBranch)  [[unlikely]] {
+#ifndef NDEBUG
+        failed_ = true;
+#endif
+        sys_println("{\"err\":\"unfold_not_branch\"}");
+        return UnfoldResult::kUndefined;
     }
 
     auto& grid_line = grid_[depth_];
-    if (auto s = grid_line.child_depth[slot]; s) {
+    if (auto s = grid_line.child_depth[slot]; s) {  // Unfolded child exists
         if (s > grid_.size()) [[unlikely]] {
+#ifndef NDEBUG
+            failed_ = true;
+#endif
             sys_println("{\"err\":\"child_depth > size\"}");
-            return false;
+            return UnfoldResult::kUndefined;
         }
         depth_ = s;
-        return true;
+        return UnfoldResult::kSuccess;
     }
 
     auto child_len = grid_line.branch.child_len[slot];
-    if (child_len == 0) {  // empty, nothing to "unfold"
-        return false;
-    }
     auto& child = grid_line.branch.child[slot];
+
+    if (child_len == 0 || 
+        (child_len == 1 && child.bytes[0] == 0x80)) {  // empty, nothing to "unfold"
+        return UnfoldResult::kEmpty;
+    }
+
     ByteView rlp;
     if (child_len == 32) {
         // Hash ref
-        auto rlp_opt = node_store_.get_rlp(child);
+        bytes32 ck;
+        const uint8_t* hs = grid_line.branch.child_ptr[slot] ? grid_line.branch.child_ptr[slot] : child.bytes;
+        std::memcpy(ck.bytes, hs, 32);
+        auto rlp_opt = state_->find_node_rlp(ck);
         if (!rlp_opt) [[unlikely]] {
+            ++missing_count_;
+#ifndef NDEBUG
+            failed_ = true;
+#endif
             sys_println("{\"err\":\"node_store_get_rlp_failed\"}");
-            return false;
+            return UnfoldResult::kMissing;
         }
         rlp = *rlp_opt;
     } else {
@@ -452,13 +581,20 @@ inline bool GridMPT<DeletionEnabled>::unfold_slot(unsigned slot) {
         rlp = ByteView{embedded_rlp_copies_.back().bytes, child_len};
     }
     if (rlp.size() == 0) [[unlikely]] {
-        sys_println(("{\"err\":\"rlp_size_0\",\"slot\":" + std::to_string(slot) + ",\"child_len\":" + std::to_string(child_len) + "}").c_str());
-        return false;
+#ifndef NDEBUG
+        failed_ = true;
+#endif
+        sys_println("{\"err\":\"rlp_size_0\"}");
+        return UnfoldResult::kMissing;
     }
     bool success = unfold_node_from_rlp(rlp, slot, depth_);
     if (success)
         grid_line.child_depth[slot] = depth_;
-    return success;
+#ifndef NDEBUG
+    else
+        failed_ = true;  // unfold_node_from_rlp already flags; explicit for the sentinel
+#endif
+    return success ? UnfoldResult::kSuccess : UnfoldResult::kMissing;
 }
 
-}  // namespace silkworm::mpt
+}  // namespace zilkworm

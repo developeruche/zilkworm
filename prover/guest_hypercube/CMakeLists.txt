@@ -1,3 +1,6 @@
+# Copyright 2026 The Zilkworm Authors
+# SPDX-License-Identifier: Apache-2.0
+
 cmake_minimum_required(VERSION 3.28)
 
 set(Z6M_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
@@ -13,13 +16,6 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_compile_definitions(SP1)
-
-include(CableBuildInfo)
-cable_add_buildinfo_library(
-    PROJECT_NAME zilkworm
-    GIT_DESCRIBE ""
-    GIT_BRANCH ""
-)
 
 include(GNUInstallDirs)
 
@@ -53,6 +49,8 @@ target_link_options(z6m_guest PRIVATE
     -z norelro
     -Wl,--gc-sections
     -Wl,-e,_start
+    -Wl,--wrap=memcpy
+    -Wl,--wrap=memmove
 )
 
 # Library search path: use the toolchain's rv64im/lp64 sysroot libraries.

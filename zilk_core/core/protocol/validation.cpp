@@ -1,13 +1,17 @@
-// Copyright 2025 The Silkworm Authors
+// Copyright 2026 The Zilkworm Authors (modifications)
+// Copyright 2025 The Original Silkworm Authors
 // SPDX-License-Identifier: Apache-2.0
 
 #include "validation.hpp"
 
+#include <algorithm>
 #include <bit>
+#include <cstring>
+
+#include <evmone/constants.hpp>
 
 #include <zilk_core/core/common/empty_hashes.hpp>
 #include <zilk_core/core/crypto/secp256k1n.hpp>
-#include <zilk_core/core/execution/evm.hpp>
 #include <zilk_core/core/rlp/encode_vector.hpp>
 #include <zilk_core/core/trie/vector_root.hpp>
 
@@ -38,7 +42,7 @@ ValidationResult pre_validate_transaction(const Transaction& txn, const evmc_rev
     }
 
     if (!is_valid_signature(txn.r, txn.s, rev >= EVMC_HOMESTEAD)) {
-        // return ValidationResult::kInvalidSignature;
+        return ValidationResult::kInvalidSignature;
     }
 
     if (rev >= EVMC_LONDON) {
@@ -59,22 +63,23 @@ ValidationResult pre_validate_transaction(const Transaction& txn, const evmc_rev
     return ValidationResult::kOk;
 }
 
-ValidationResult validate_transaction(const Transaction& txn, const IntraBlockState& state,
+ValidationResult validate_transaction(const Transaction& txn, const ::zilkworm::DirectState& state,
                                       uint64_t available_gas) noexcept {
     const std::optional<evmc::address> sender{txn.sender()};
     if (!sender) {
         return ValidationResult::kInvalidSignature;
     }
 
-    if (state.get_code_hash(*sender) != kEmptyHash) {
-        const auto code = state.get_code(*sender);
+    const auto* acc = state.read_account(*sender);
+    const bool has_code = acc && std::memcmp(acc->code_hash, kEmptyHash.bytes, 32) != 0;
+    if (has_code) {
+        const auto code = state.read_code(*sender);
         if (!eip7702::is_code_delegated(code)) {
-            return ValidationResult::kSenderNoEOA;  // EIP-3607
+            return ValidationResult::kSenderNoEOA;
         }
     }
 
-    const uint64_t nonce{state.get_nonce(*sender)};
-    if (nonce != txn.nonce) {
+    if (state.get_nonce(*sender) != txn.nonce) {
         return ValidationResult::kWrongNonce;
     }
 
@@ -110,35 +115,6 @@ ValidationResult pre_validate_transactions(const Block& block, const ChainConfig
     return ValidationResult::kOk;
 }
 
-ValidationResult validate_call_precheck(const Transaction& txn, const EVM& evm) noexcept {
-    const std::optional sender{txn.sender()};
-    if (!sender) {
-        return ValidationResult::kInvalidSignature;
-    }
-
-    if (const auto common_check = pre_validate_common_base(txn, evm.revision(), evm.config().chain_id); common_check != ValidationResult::kOk) {
-        return common_check;
-    }
-
-    if (evm.revision() >= EVMC_LONDON) {
-        if (txn.max_fee_per_gas > 0 || txn.max_priority_fee_per_gas > 0) {
-            if (txn.max_fee_per_gas < txn.max_priority_fee_per_gas) {
-                return ValidationResult::kMaxPriorityFeeGreaterThanMax;
-            }
-
-            if (txn.max_fee_per_gas < evm.block().header.base_fee_per_gas) {
-                return ValidationResult::kMaxFeeLessThanBase;
-            }
-        }
-    }
-
-    if (const auto forks_check = pre_validate_common_forks(txn, evm.revision(), evm.block().header.blob_gas_price(evm.config())); forks_check != ValidationResult::kOk) {
-        return forks_check;
-    }
-
-    return ValidationResult::kOk;
-}
-
 ValidationResult pre_validate_common_base(const Transaction& txn, evmc_revision revision, uint64_t chain_id) noexcept {
     if (txn.chain_id.has_value()) {
         if (revision < EVMC_SPURIOUS_DRAGON) {
@@ -154,7 +130,24 @@ ValidationResult pre_validate_common_base(const Transaction& txn, evmc_revision 
         return ValidationResult::kUnsupportedTransactionType;
     }
 
-    const intx::uint128 g0{intrinsic_gas(txn, revision)};
+    // EIP-2780/8037 (Amsterdam): g0 is the regular-gas intrinsic only; the state-dependent
+    // charges are made at the top frame, not here.
+    intx::uint128 g0;
+    if (revision >= EVMC_AMSTERDAM) {
+        const auto cost = amsterdam_tx_gas_cost(txn);
+        // EIP-8037 transaction-validation condition 1: the reservoir model needs
+        // regular_gas_budget = TX_MAX_GAS_LIMIT - intrinsic_regular_gas to stay
+        // non-negative, so the regular intrinsic and the calldata floor are each
+        // capped at TX_MAX_GAS_LIMIT even though Amsterdam lifts the cap on
+        // txn.gas_limit itself. Mirrors evmone's validate_transaction.
+        constexpr int64_t kMaxTxGasLimit = 0x1000000;  // 2**24
+        if (std::max(cost.regular, cost.floor) > kMaxTxGasLimit) {
+            return ValidationResult::kIntrinsicGas;
+        }
+        g0 = static_cast<uint64_t>(cost.regular);
+    } else {
+        g0 = intrinsic_gas(txn, revision);
+    }
     if (txn.gas_limit < g0) {
         return ValidationResult::kIntrinsicGas;
     }
@@ -172,9 +165,13 @@ ValidationResult pre_validate_common_base(const Transaction& txn, evmc_revision 
 }
 
 ValidationResult pre_validate_common_forks(const Transaction& txn, const evmc_revision rev, const std::optional<intx::uint256>& blob_gas_price) noexcept {
-    // EIP-3860: Limit and meter initcode
+    // EIP-3860: Limit and meter initcode.
+    // EIP-7954 (Amsterdam): MAX_INITCODE_SIZE doubles to 2 * 0x10000.
+    // TODO(chfast): duplicate of evmone lib/evmone/constants.hpp.
     const bool contract_creation{!txn.to};
-    if (rev >= EVMC_SHANGHAI && contract_creation && txn.data.size() > kMaxInitCodeSize) {
+    const size_t max_initcode =
+        (rev >= EVMC_AMSTERDAM) ? size_t{evmone::MAX_INITCODE_SIZE_AMSTERDAM} : kMaxInitCodeSize;
+    if (rev >= EVMC_SHANGHAI && contract_creation && txn.data.size() > max_initcode) {
         return ValidationResult::kMaxInitCodeSizeExceeded;
     }
 
@@ -210,64 +207,30 @@ ValidationResult pre_validate_common_forks(const Transaction& txn, const evmc_re
                 return ValidationResult::kEmptyAuthorizations;
             }
         }
-        // EIP-7623
-        const auto floor_cost = protocol::floor_cost(txn);
-        if (txn.gas_limit < floor_cost) {
+        // EIP-7623 (Prague) / EIP-7976 + EIP-7981 (Amsterdam): revision-aware floor.
+        const auto floor = rev >= EVMC_AMSTERDAM
+                               ? static_cast<uint64_t>(amsterdam_tx_gas_cost(txn).floor)
+                               : protocol::floor_cost(txn);
+        if (txn.gas_limit < floor) {
             return ValidationResult::kFloorCost;
         }
     }
 
-    if (rev >= EVMC_OSAKA) {
+    // TODO(chfast): duplicate of evmone::state validation in state.cpp.
+    if (rev >= EVMC_OSAKA && rev < EVMC_AMSTERDAM) {
         /// The maximum allowed gas limit for a transaction (EIP-7825).
         constexpr auto MAX_TX_GAS_LIMIT = 0x1000000;  // 2**24
         if (txn.gas_limit > MAX_TX_GAS_LIMIT) {
             return ValidationResult::kMaxTransactionGasLimitExceeded;
         }
+    }
+    if (rev >= EVMC_OSAKA) {
         if (txn.blob_versioned_hashes.size() > 6) {
             return ValidationResult::kTooManyBlobs;
         }
     }
 
     return ValidationResult::kOk;
-}
-
-ValidationResult validate_call_funds(const Transaction& txn, const EVM& evm, const intx::uint256& owned_funds, bool bailout) noexcept {
-    const intx::uint256 base_fee{evm.block().header.base_fee_per_gas.value_or(0)};
-    const intx::uint256 effective_gas_price{txn.max_fee_per_gas >= evm.block().header.base_fee_per_gas ? txn.effective_gas_price(base_fee)
-                                                                                                       : txn.max_priority_fee_per_gas};
-
-    intx::uint512 required_funds = compute_call_cost(txn, effective_gas_price, evm);
-    // EIP-7623 Increase calldata cost
-    if (evm.revision() >= EVMC_PRAGUE) {
-        const auto floor_cost = protocol::floor_cost(txn);
-        const intx::uint512 gas_limit = std::max(txn.gas_limit, floor_cost);
-        required_funds = std::max(required_funds, gas_limit * effective_gas_price);
-    }
-    const intx::uint256 value = bailout ? 0 : txn.value;
-    if (owned_funds < required_funds + value) {
-        return ValidationResult::kInsufficientFunds;
-    }
-    return ValidationResult::kOk;
-}
-
-intx::uint256 compute_call_cost(const Transaction& txn, const intx::uint256& effective_gas_price, const EVM& evm) {
-    // EIP-1559 normal gas cost
-    intx::uint256 required_funds;
-    if (txn.max_fee_per_gas > 0 || txn.max_priority_fee_per_gas > 0) {
-        // This method should be called after check (max_fee and base_fee) present in pre_check() method
-        required_funds = txn.gas_limit * effective_gas_price;
-    } else {
-        required_funds = 0;
-    }
-
-    // EIP-4844 blob gas cost (calc_data_fee)
-    if (evm.block().header.blob_gas_used && evm.revision() >= EVMC_CANCUN) {
-        // compute blob fee for eip-4844 data blobs if any
-        const intx::uint256 blob_gas_price{evm.block().header.blob_gas_price(evm.config()).value_or(0)};
-        required_funds += txn.total_blob_gas() * blob_gas_price;
-    }
-
-    return required_funds;
 }
 
 intx::uint256 expected_base_fee_per_gas(const BlockHeader& parent) {

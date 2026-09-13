@@ -1,50 +1,44 @@
-// Copyright 2025 The Silkworm Authors
+// Copyright 2026 The Zilkworm Authors (modifications)
+// Copyright 2025 The Original Silkworm Authors
 // SPDX-License-Identifier: Apache-2.0
 
 #include "state_transition.hpp"
 
 #include <bit>
+#include <cassert>
+#include <cstring>
 #include <format>
 #include <fstream>
+#include <memory>
+#include <new>
+#include <string_view>
+#include <type_traits>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include <magic_enum/magic_enum.hpp>
 #include <nlohmann/json.hpp>
 #include <zilk_core/core/chain/genesis.hpp>
 #include <zilk_core/core/common/test_util.hpp>
 #include <zilk_core/core/common/util.hpp>
-#include <zilk_core/core/execution/execution.hpp>
+#include <zilk_core/core/common_zz/inline_vec.hpp>
 #include <zilk_core/core/protocol/blockchain.hpp>
 #include <zilk_core/core/protocol/param.hpp>
 #include <zilk_core/core/protocol/rule_set.hpp>
 #include <zilk_core/core/rlp/encode_vector.hpp>
-#include <zilk_core/core/state/in_memory_state.hpp>
+#include <zilk_core/core/trie/hash_builder.hpp>
+#include <zilk_core/core/trie/nibbles.hpp>
 #include <zilk_core/core/trie_zz/mpt.hpp>
 #include <zilk_core/core/types/address.hpp>
 #include <zilk_core/core/types/evmc_bytes32.hpp>
+#include <zilk_core/core/types_zz/flat_bundle.hpp>
 #include <zilk_core/print.hpp>
 
 namespace silkworm::cmd::state_transition {
 
-StateTransition::StateTransition(std::string_view json_str, const bool terminate_on_error, const bool show_diagnostics) noexcept
-    : json_str_{json_str},
-      terminate_on_error_{terminate_on_error},
-      show_diagnostics_{show_diagnostics} {
-}
-
-StateTransition::StateTransition(ByteView& unified_rlp) noexcept
-    : unified_rlp_{unified_rlp} {
-}
-
-StateTransition::StateTransition(const std::string& unified_rlp_str) noexcept {
-    // Copy the data to own it
-    unified_rlp_data_ = unified_rlp_str;
-    unified_rlp_ = ByteView{reinterpret_cast<const uint8_t*>(unified_rlp_data_.data()), unified_rlp_data_.size()};
-}
-
-StateTransition::StateTransition(std::string&& unified_rlp_str) noexcept
-    : unified_rlp_data_{std::move(unified_rlp_str)} {
-    // Create view into the moved data
-    unified_rlp_ = ByteView{reinterpret_cast<const uint8_t*>(unified_rlp_data_.data()), unified_rlp_data_.size()};
+StateTransition::StateTransition(std::span<uint8_t> envelope) noexcept
+    : envelope_{envelope} {
 }
 
 evmc::address StateTransition::to_evmc_address(const std::string& address) {
@@ -60,21 +54,6 @@ std::unique_ptr<evmc::address> StateTransition::sender_to_address(const std::str
     return std::make_unique<evmc::address>(hex_to_address(sender));
 }
 
-/*
-//  * This function is used to clean up the state after a failed block execution.
-//  * Certain post-processing would be a part of the execute_transaction() function,
-//  * but since the validation failed, we need to do it manually.
-//  */
-void cleanup_error_block(Block& block, ExecutionProcessor& processor, const evmc_revision rev) {
-    if (rev >= EVMC_SHANGHAI) {
-        processor.evm().state().access_account(block.header.beneficiary);
-    }
-    processor.evm().state().add_to_balance(block.header.beneficiary, 0);
-    processor.evm().state().finalize_transaction(rev);
-    processor.evm().state().write_to_db(block.header.number);
-}
-
-// From silkworm/cmd/test/ethereum.
 namespace {
     using namespace silkworm::protocol;
     enum class Status {
@@ -83,11 +62,151 @@ namespace {
         kSkipped
     };
 
-    Status run_json_block(const nlohmann::json& json_block, Blockchain& blockchain) {
+    /// Marker indicating the test expects an RLP / structural rejection that
+    /// completes before insert_block returns a ValidationResult (e.g. malformed
+    /// RLP, oversized block). Used in @ref exception_map to express "matched at
+    /// the RLP-decode short-circuit, not via a ValidationResult."
+    inline constexpr auto kPreInsertReject = static_cast<ValidationResult>(-1);
+
+    /// Map an EEST @c expectException string ("TransactionException.X" /
+    /// "BlockException.Y") to the silkworm ValidationResult set that satisfies
+    /// it. The runner requires an exact match: if silkworm rejects via a code
+    /// outside the mapped set, the test fails. This catches implementations
+    /// that bypass the spec-required pre-validate gate and rely on an
+    /// incidental post-execute check (state-root mismatch, gas-used mismatch).
+    const std::unordered_map<std::string_view, std::vector<ValidationResult>>& exception_map() {
+        static const std::unordered_map<std::string_view, std::vector<ValidationResult>> m{
+            // Transaction-level rejections (must fire in pre-validate / per-tx validate).
+            // evmone unifies both gates under INTRINSIC_GAS_TOO_LOW (`gas_limit < max(total_intrinsic, min_cost)`),
+            // so the umbrella category accepts either silkworm enum.
+            {"TransactionException.INTRINSIC_GAS_TOO_LOW",                  {ValidationResult::kIntrinsicGas, ValidationResult::kFloorCost}},
+            {"TransactionException.INTRINSIC_GAS_BELOW_FLOOR_GAS_COST",     {ValidationResult::kFloorCost}},
+            {"TransactionException.INSUFFICIENT_ACCOUNT_FUNDS",             {ValidationResult::kInsufficientFunds}},
+            {"TransactionException.INSUFFICIENT_MAX_FEE_PER_GAS",           {ValidationResult::kMaxFeeLessThanBase}},
+            {"TransactionException.INSUFFICIENT_MAX_FEE_PER_BLOB_GAS",      {ValidationResult::kMaxFeePerBlobGasTooLow}},
+            {"TransactionException.NONCE_IS_MAX",                           {ValidationResult::kNonceTooHigh}},
+            {"TransactionException.NONCE_MISMATCH_TOO_HIGH",                {ValidationResult::kWrongNonce}},
+            {"TransactionException.NONCE_MISMATCH_TOO_LOW",                 {ValidationResult::kWrongNonce}},
+            {"TransactionException.PRIORITY_GREATER_THAN_MAX_FEE_PER_GAS",  {ValidationResult::kMaxPriorityFeeGreaterThanMax}},
+            {"TransactionException.SENDER_NOT_EOA",                         {ValidationResult::kSenderNoEOA}},
+            {"TransactionException.INVALID_CHAINID",                        {ValidationResult::kWrongChainId, kPreInsertReject}},
+            // Bad r/s reject at the pre-validate signature gate; a bad v or an
+            // over-32-byte r/s cannot decode as a signature field, so the block
+            // fails RLP decode first - EEST classifies both as INVALID_SIGNATURE_VRS.
+            {"TransactionException.INVALID_SIGNATURE_VRS",                  {ValidationResult::kInvalidSignature, kPreInsertReject}},
+            {"TransactionException.GAS_ALLOWANCE_EXCEEDED",                 {ValidationResult::kBlockGasLimitExceeded}},
+            {"TransactionException.GAS_LIMIT_EXCEEDS_MAXIMUM",              {ValidationResult::kMaxTransactionGasLimitExceeded}},
+            {"TransactionException.TYPE_1_TX_PRE_FORK",                     {ValidationResult::kUnsupportedTransactionType}},
+            {"TransactionException.TYPE_2_TX_PRE_FORK",                     {ValidationResult::kUnsupportedTransactionType}},
+            {"TransactionException.GASLIMIT_PRICE_PRODUCT_OVERFLOW",        {ValidationResult::kInsufficientFunds}},
+            {"TransactionException.INITCODE_SIZE_EXCEEDED",                 {ValidationResult::kMaxInitCodeSizeExceeded}},
+            {"TransactionException.TYPE_3_TX_PRE_FORK",                     {ValidationResult::kUnsupportedTransactionType}},
+            {"TransactionException.TYPE_4_TX_PRE_FORK",                     {ValidationResult::kUnsupportedTransactionType}},
+            {"TransactionException.TYPE_3_TX_ZERO_BLOBS",                   {ValidationResult::kNoBlobs}},
+            {"TransactionException.TYPE_3_TX_BLOB_COUNT_EXCEEDED",          {ValidationResult::kTooManyBlobs}},
+            {"TransactionException.TYPE_3_TX_INVALID_BLOB_VERSIONED_HASH",  {ValidationResult::kWrongBlobCommitmentVersion}},
+            {"TransactionException.TYPE_3_TX_MAX_BLOB_GAS_ALLOWANCE_EXCEEDED", {ValidationResult::kTooManyBlobs, ValidationResult::kInsufficientFunds}},
+            {"TransactionException.TYPE_3_TX_CONTRACT_CREATION",            {ValidationResult::kProhibitedContractCreation}},
+            {"TransactionException.TYPE_3_TX_WITH_FULL_BLOBS",              {ValidationResult::kInvalidSignature}},
+            {"TransactionException.TYPE_4_TX_CONTRACT_CREATION",            {ValidationResult::kProhibitedContractCreation}},
+            {"TransactionException.TYPE_4_EMPTY_AUTHORIZATION_LIST",        {ValidationResult::kEmptyAuthorizations}},
+
+            // Block-level rejections.
+            {"BlockException.INVALID_GASLIMIT",                             {ValidationResult::kInvalidGasLimit, ValidationResult::kGasAboveLimit}},
+            {"BlockException.INVALID_BASEFEE_PER_GAS",                      {ValidationResult::kWrongBaseFee}},
+            {"BlockException.INCORRECT_BLOB_GAS_USED",                      {ValidationResult::kWrongBlobGasUsed}},
+            {"BlockException.INCORRECT_EXCESS_BLOB_GAS",                    {ValidationResult::kWrongExcessBlobGas}},
+            {"BlockException.BLOB_GAS_USED_ABOVE_LIMIT",                    {ValidationResult::kWrongBlobGasUsed}},
+            {"BlockException.INVALID_WITHDRAWALS_ROOT",                     {ValidationResult::kWrongWithdrawalsRoot}},
+            {"BlockException.INVALID_REQUESTS",                             {ValidationResult::kRequestsRootMismatch, ValidationResult::kRequestsProcessingFailure}},
+            {"BlockException.INVALID_DEPOSIT_EVENT_LAYOUT",                 {ValidationResult::kRequestsProcessingFailure}},
+            {"BlockException.SYSTEM_CONTRACT_CALL_FAILED",                  {ValidationResult::kRequestsProcessingFailure}},
+            {"BlockException.SYSTEM_CONTRACT_EMPTY",                        {ValidationResult::kRequestsProcessingFailure}},
+            {"BlockException.INVALID_VERSIONED_HASHES",                     {ValidationResult::kWrongBlobCommitmentVersion}},
+            // EIP-7928: malformed BAL bytes (wrong account order, duplicate account, etc.).
+            // evmone canonicalises (sort + dedup) when rebuilding; the resulting hash
+            // diverges from the header's, so silkworm reports kBlockAccessListHashMismatch
+            // via the same code path as semantic BAL violations.
+            // A post-fork header missing the BAL-hash field short-circuits in
+            // rlp::decode (the trailing optionals misparse) -> kPreInsertReject.
+            {"BlockException.INVALID_BAL_HASH",                             {ValidationResult::kBlockAccessListHashMismatch, kPreInsertReject}},
+            // Pre-fork header carrying post-fork fields: EEST names the resulting
+            // hash divergence INVALID_BLOCK_HASH; we reject it semantically.
+            {"BlockException.INVALID_BLOCK_HASH",                           {ValidationResult::kFieldBeforeFork, ValidationResult::kMissingField, kPreInsertReject}},
+            {"BlockException.INVALID_BLOCK_ACCESS_LIST",                    {ValidationResult::kBlockAccessListHashMismatch, ValidationResult::kBlockAccessListGasExceeded}},
+            {"BlockException.BLOCK_ACCESS_LIST_GAS_LIMIT_EXCEEDED",         {ValidationResult::kBlockAccessListGasExceeded}},
+            {"BlockException.INCORRECT_BLOCK_FORMAT",                       {ValidationResult::kFieldBeforeFork, ValidationResult::kMissingField, ValidationResult::kBlockAccessListHashMismatch, kPreInsertReject}},
+            {"BlockException.GAS_USED_OVERFLOW",                            {ValidationResult::kWrongBlockGas, ValidationResult::kBlockGasLimitExceeded}},
+            // RLP-shape rejections short-circuit in rlp::decode / size check
+            // before insert_block runs. Mark them with a sentinel so the runner
+            // can match without consulting a ValidationResult.
+            {"BlockException.RLP_STRUCTURES_ENCODING",                      {kPreInsertReject}},
+            {"BlockException.RLP_BLOCK_LIMIT_EXCEEDED",                     {kPreInsertReject}},
+        };
+        return m;
+    }
+
+    /// Returns true iff @p got is one of the silkworm ValidationResults that
+    /// satisfies any pipe-separated alternative in @p expectation. Unknown
+    /// tokens are ignored (the other alternatives in a `A|B` composite can
+    /// still match); if no token resolves to a ValidationResult set containing
+    /// @p got, the match fails — there is no permissive fallback, so an
+    /// EEST fixture pinning a new exception string forces a map update.
+    bool strict_exception_match(ValidationResult got, std::string_view expectation) {
+        if (expectation.empty()) return false;  // Empty expectation is never valid.
+        const auto& m = exception_map();
+        size_t pos = 0;
+        while (pos <= expectation.size()) {
+            const auto pipe = expectation.find('|', pos);
+            const auto end = (pipe == std::string_view::npos) ? expectation.size() : pipe;
+            const std::string_view tok = expectation.substr(pos, end - pos);
+            if (const auto it = m.find(tok); it != m.end()) {
+                for (const auto r : it->second) {
+                    if (r == got) return true;
+                }
+            }
+            if (pipe == std::string_view::npos) break;
+            pos = pipe + 1;
+        }
+        return false;
+    }
+
+    /// Same as @ref strict_exception_match but for the pre-insert reject path
+    /// (RLP decode or oversized-block short-circuit): returns true iff at least
+    /// one alternative in @p expectation resolves to a set containing
+    /// @ref kPreInsertReject.
+    bool strict_exception_match_pre_insert(std::string_view expectation) {
+        return strict_exception_match(kPreInsertReject, expectation);
+    }
+
+    Status run_json_block(const nlohmann::json& json_block, Blockchain& blockchain, DirectState& direct) {
         bool invalid{json_block.contains("expectException")};
+        const std::string expectation = invalid ? json_block["expectException"].get<std::string>() : std::string{};
+
+        // Helper to verify a rejection matches expectation when invalid is true.
+        // For pre-insert rejections (RLP / oversize), pass nullopt; otherwise pass
+        // the silkworm ValidationResult.
+        const auto check_strict = [&](std::optional<ValidationResult> got) -> bool {
+            if (!got.has_value()) {
+                return strict_exception_match_pre_insert(expectation);
+            }
+            return strict_exception_match(*got, expectation);
+        };
+
+        // Common diagnostic helper. @p rejection_mode identifies which gate fired
+        // (real ValidationResult name, or one of the pre-insert short-circuits).
+        const auto fail_strict = [&](std::string_view rejection_mode) {
+            sys_println(std::format("STRICT: rejected via {} but expected {}",
+                rejection_mode, expectation).c_str());
+        };
+
         std::optional<Bytes> rlp{from_hex(json_block["rlp"].get<std::string>())};
         if (!rlp) {
             if (invalid) {
+                if (!check_strict(std::nullopt)) {
+                    fail_strict("bad-hex");
+                    return Status::kFailed;
+                }
                 return Status::kPassed;
             }
             sys_println("Failure to read hex");
@@ -105,8 +224,13 @@ namespace {
         constexpr size_t MAX_RLP_BLOCK_SIZE = MAX_BLOCK_SIZE - SAFETY_MARGIN;
 
         if (view.size() > MAX_RLP_BLOCK_SIZE) {
-            if (invalid)
+            if (invalid) {
+                if (!check_strict(std::nullopt)) {
+                    fail_strict("oversize-block");
+                    return Status::kFailed;
+                }
                 return Status::kPassed;
+            }
 
             // TODO: Ignore big blocks before Osaka because we don't have fork config here.
             return Status::kSkipped;
@@ -114,91 +238,49 @@ namespace {
 
         if (!rlp::decode(view, block)) {
             if (invalid) {
+                if (!check_strict(std::nullopt)) {
+                    fail_strict("rlp-decode");
+                    return Status::kFailed;
+                }
                 return Status::kPassed;
             }
             sys_println("Failure to decode RLP");
+            return Status::kFailed;
+        }
+        // Only after decode: the fork gate needs the block's number/timestamp.
+        if (rlp->size() > kMaxRlpBlockSize && blockchain.config().revision(block.header.number, block.header.timestamp) >= EVMC_OSAKA) {
+            if (invalid) {
+                if (!check_strict(std::nullopt)) {
+                    fail_strict("oversize-block");
+                    return Status::kFailed;
+                }
+                return Status::kPassed;
+            }
+            sys_println("Block exceeded kMaxRlpBlockSize");
             return Status::kFailed;
         }
 
         const bool check_state_root{true};
         if (ValidationResult err{blockchain.insert_block(block, check_state_root)}; err != ValidationResult::kOk) {
             if (invalid) {
+                if (!check_strict(err)) {
+                    fail_strict(magic_enum::enum_name<ValidationResult>(err));
+                    return Status::kFailed;
+                }
                 return Status::kPassed;
             }
-            sys_println(std::format("Validation error {}", magic_enum::enum_name<ValidationResult>(err)).c_str());
+            sys_println(std::format("ERROR: validation error {}", magic_enum::enum_name<ValidationResult>(err)).c_str());
             return Status::kFailed;
         }
 
         if (invalid) {
             sys_println("Invalid block executed successfully");
-            sys_println(std::format("Expected: {}", json_block["expectException"].dump()).c_str());
+            sys_println("ERROR: expected exception");
             return Status::kFailed;
         }
 
+        direct.insert_header(block.header);
         return Status::kPassed;
-    }
-
-    bool post_check(const InMemoryState& state, const nlohmann::json& expected) {
-        if (state.accounts().size() != expected.size()) {
-            sys_println(std::format("Account number mismatch: {} != {}", state.accounts().size(), expected.size()).c_str());
-
-            // Find and report accounts missing from the expected set.
-            for (const auto& [addr, _] : state.accounts()) {
-                if (const auto addr_hex = "0x" + hex(addr); !expected.contains(addr_hex)) {
-                    sys_println(std::format("Unexpected account: {}", addr_hex).c_str());
-                }
-            }
-
-            return false;
-        }
-
-        for (const auto& entry : expected.items()) {
-            const evmc::address address{hex_to_address(entry.key())};
-            const nlohmann::json& j{entry.value()};
-
-            std::optional<Account> account{state.read_account(address)};
-            if (!account) {
-                sys_println(std::format("Missing account {}", entry.key()).c_str());
-                return false;
-            }
-
-            const auto expected_balance{intx::from_string<intx::uint256>(j["balance"].get<std::string>())};
-            if (account->balance != expected_balance) {
-                sys_println(std::format("Balance mismatch for {}:\n{} != {}", entry.key(), to_string(account->balance, 16), j["balance"].get<std::string>()).c_str());
-                return false;
-            }
-
-            const auto expected_nonce{intx::from_string<intx::uint256>(j["nonce"].get<std::string>())};
-            if (account->nonce != expected_nonce) {
-                sys_println(std::format("Nonce mismatch for {}:\n{} != {}", entry.key(), account->nonce, j["nonce"].get<std::string>()).c_str());
-                return false;
-            }
-
-            auto expected_code{j["code"].get<std::string>()};
-            Bytes actual_code{state.read_code(address, account->code_hash)};
-            if (actual_code != from_hex(expected_code)) {
-                sys_println(std::format("Code mismatch for {}:\n{} != {}", entry.key(), to_hex(actual_code), expected_code).c_str());
-                return false;
-            }
-
-            size_t storage_size{state.storage_size(address)};
-            if (storage_size != j["storage"].size()) {
-                sys_println(std::format("Storage size mismatch for {}:\n{} != {}", entry.key(), storage_size, j["storage"].size()).c_str());
-                return false;
-            }
-
-            for (const auto& storage : j["storage"].items()) {
-                Bytes key{from_hex(storage.key()).value()};
-                Bytes expected_value{from_hex(storage.value().get<std::string>()).value()};
-                evmc::bytes32 actual_value{state.read_storage(address, to_bytes32(key))};
-                if (actual_value != to_bytes32(expected_value)) {
-                    sys_println(std::format("Storage mismatch for {} at {}:\n{} != {}", entry.key(), storage.key(), to_hex(actual_value), to_hex(expected_value)).c_str());
-                    return false;
-                }
-            }
-        }
-
-        return true;
     }
 
     struct [[nodiscard]] RunResults {
@@ -236,7 +318,7 @@ namespace {
         const auto network{json_test["network"].get<std::string>()};
         const auto config_it{test::kNetworkConfig.find(network)};
         if (config_it == test::kNetworkConfig.end()) {
-            sys_println(std::format("unknown network {}", network).c_str());
+            sys_println("ERROR: unknown network");
             return Status::kSkipped;
         }
         auto genesisRLPStr = json_test["genesisRLP"].get<std::string>();
@@ -248,203 +330,444 @@ namespace {
             return Status::kFailed;
         }
 
-        InMemoryState state{read_genesis_allocation(json_test["pre"])};
-        Blockchain blockchain{state, config_it->second, genesis_block};
-        // blockchain.exo_evm = exo_evm;
+        // blob must outlive direct.
+        auto blob = read_genesis_allocation(json_test["pre"]);
+        DirectState direct{std::span<uint8_t>{blob.data(), blob.size()}};
+        if (!direct.sanitize()) {
+            sys_println("ERROR: blockchain_test sanitize failed (identity↔hash mismatch)");
+            return Status::kFailed;
+        }
+        Blockchain blockchain{direct, config_it->second, genesis_block};
 
         for (const auto& json_block : json_test["blocks"]) {
-            Status status{run_json_block(json_block, blockchain)};
+            Status status{run_json_block(json_block, blockchain, direct)};
             if (status != Status::kPassed) {
                 return status;
             }
         }
 
         if (json_test.contains("postStateHash")) {
-            evmc::bytes32 state_root{state.state_root_hash()};
+            const auto state_root = direct.state_root_hash();
+            if (!state_root) {
+                sys_println("ERROR: state_root_hash failed (witness incomplete)");
+                return Status::kFailed;
+            }
             std::string expected_hex{json_test["postStateHash"].get<std::string>()};
-            if (state_root != to_bytes32(from_hex(expected_hex).value())) {
-                sys_println(std::format("postStateHash mismatch:\n{} != {}", to_hex(state_root), expected_hex).c_str());
+            if (*state_root != to_bytes32(from_hex(expected_hex).value())) {
+                sys_println("ERROR: postStateHash mismatch");
                 return Status::kFailed;
             }
             return Status::kPassed;
         }
-
-        if (post_check(state, json_test["postState"])) {
-            return Status::kPassed;
-        }
-        return Status::kFailed;
+        return Status::kPassed;
     }
 }  // namespace
 
-uint64_t StateTransition::run_rlp() {
-    sys_println(std::format("run_rlp: Unified RLP length: {}", unified_rlp_.size()).c_str());
-
-    Block genesisBlock, block;
-
-    const auto rlp_head{rlp::decode_header(unified_rlp_)};
-    if (!rlp_head) {
-        sys_println("ERROR: Failed to Decode unified_rlp overall header");
-        return 0;
+std::pair<uint64_t, bool> StateTransition::run_one_bundle(::zilkworm::FlatBundle& bundle) {
+    if (!bundle.direct.sanitize()) {
+        sys_println("ERROR: Witness sanitize failed (identity↔hash mismatch)");
+        failed_ = true;
+        return {0, false};
     }
-    if (!rlp_head->list) {
-        sys_println(std::format("ERROR: Failed to Decode unified_rlp: Not list. Payload length: {}", rlp_head->payload_length).c_str());
-        return 0;
+    for (const auto& h : bundle.ancestors) {
+        bundle.direct.insert_header(h);
     }
 
-    // Decode Genesis Block
-    ByteView payload_view = unified_rlp_.substr(0, rlp_head->payload_length);
-    if (payload_view.empty()) {
-        sys_println("ERROR: Failed to Decode unified_rlp payload view");
-        return 0;
+    const auto cfg_it = test::kNetworkConfig.find(std::string{bundle.network});
+    if (cfg_it == test::kNetworkConfig.end()) [[unlikely]] {
+        sys_println("ERROR: unknown network in flat bundle");
+        failed_ = true;
+        return {0, false};
     }
-    auto genesis_header = rlp::decode_header(payload_view);
-    if (!genesis_header) {
-        sys_println("ERROR: Failed to Decode Genesis Block RLP");
-        return 0;
-    }
-    ByteView genesis_payload = payload_view.substr(0, genesis_header->payload_length);
-    if (!rlp::decode(genesis_payload, genesisBlock)) {
-        sys_println("ERROR: Failed to Decode Genesis Block RLP");
-        return 0;
-    }
-    payload_view.remove_prefix(genesis_header->payload_length);
+    chain_id_ = cfg_it->second.chain_id;
+    bundle.direct.set_multi_block(bundle.block_rlps.size() > 1);
+    Blockchain blockchain{bundle.direct, cfg_it->second, bundle.genesis};
+    uint64_t cumulative_gas = 0;
+    bool first_root_check = true;
+    for (size_t i = 0; i < bundle.block_rlps.size(); ++i) {
+        const bool expect_invalid =
+            i < bundle.block_flags.size() &&
+            (bundle.block_flags[i] & ::zilkworm::kBlockFlagExpectInvalid);
+        Block block;
+        ByteView view{bundle.block_rlps[i]};
+        if (!rlp::decode(view, block).has_value()) {
+            if (expect_invalid) {
+                sys_println(std::format("block {} rejected as expected: decode", i));
+                continue;
+            }
+            sys_println(std::format("ERROR: block {} RLP decode failed", i));
+            failed_ = true;
+            return {0, false};
+        }
+        // Only after decode: the fork gate needs the block's number/timestamp.
+        if (bundle.block_rlps[i].size() > kMaxRlpBlockSize && cfg_it->second.revision(block.header.number, block.header.timestamp) >= EVMC_OSAKA) {
+            if (expect_invalid) {
+                sys_println(std::format("block {} rejected as expected: size", i));
+                continue;
+            } else {
+                sys_println(std::format("ERROR: block {} RLP size exceeds kMaxRlpBlockSize", i));
+                failed_ = true;
+                return {0, false};
+            }
+        }
 
-    if (payload_view.empty()) {
-        sys_println("ERROR: Failed to Decode Block RLP");
-        return 0;
+        if (ValidationResult err{blockchain.insert_block(block, false)}; err != ValidationResult::kOk) {
+            if (expect_invalid) {
+                sys_println(std::format("block {} rejected as expected: {}",
+                                        i, magic_enum::enum_name(err)));
+                continue;
+            }
+            sys_println(std::format("ERROR: validation error at block {}: {} ({})",
+                                    i, magic_enum::enum_name(err), magic_enum::enum_integer(err)));
+            failed_ = true;
+            return {0, false};
+        }
+        if (expect_invalid) {
+            sys_println(std::format("ERROR: expected-invalid block {} was accepted", i));
+            failed_ = true;
+            return {0, false};
+        }
+        const evmc_revision rev = cfg_it->second.revision(block.header.number, block.header.timestamp);
+        const bool root_ok = first_root_check
+                                 ? check_root(bundle.direct, block.header, rev)
+                                 : check_root_new_block(bundle.direct, block.header, rev);
+        first_root_check = false;
+        if (!root_ok) {
+            sys_println(std::format("ERROR: State Root Mismatch at block {}: expected {}",
+                                    i, to_hex(block.header.state_root)));
+            failed_ = true;
+            return {0, false};
+        }
+        // Last validated block in the run is the committed post-state root / block hash.
+        post_state_root_ = block.header.state_root;
+        block_hash_ = block.header.hash();
+        bundle.direct.insert_header(block.header);
+        cumulative_gas += block.header.gas_used;
     }
-    auto block_header = rlp::decode_header(payload_view);
-    if (!block_header) {
-        sys_println("ERROR: Failed to Decode Block RLP");
-        return 0;
-    }
-    ByteView block_payload = payload_view.substr(0, block_header->payload_length);
-    if (!rlp::decode(block_payload, block)) {
-        sys_println("ERROR: Failed to Decode Genesis Block RLP");
-        return 0;
-    }
-    payload_view.remove_prefix(block_header->payload_length);
+    return {cumulative_gas, true};
+}
 
-    auto pre_rlp_head = rlp::decode_header(payload_view);
-    if (!pre_rlp_head) {
-        sys_println("ERROR: Failed to Decode Pre-State RLP");
-        return 0;
+bool StateTransition::check_root(DirectState& direct_state, BlockHeader& header,
+                                 evmc_revision rev) {
+    const bool clear_empty = rev >= EVMC_SPURIOUS_DRAGON;
+    std::vector<zilkworm::AddrHashEntry> created_acc_hashes_spill;  // to be used with InlineVec additional cache area
+    zilkworm::InlineVec<zilkworm::AddrHashEntry, 32> created_acc_hashes(
+        direct_state.created_accounts().size(), created_acc_hashes_spill);
+    for (auto& [addr, _] : direct_state.created_accounts()) {
+        auto& e = created_acc_hashes.emplace_back();
+        std::memcpy(e.addr_hash, keccak_bytes(addr.bytes).bytes, 32);
+        std::memcpy(e.addr, addr.bytes, 20);
     }
-    ByteView pre_rlp_payload = payload_view.substr(0, pre_rlp_head->payload_length);
-    InMemoryState state{read_pre_state_from_rlp(pre_rlp_payload)};
-    payload_view.remove_prefix(pre_rlp_head->payload_length);
-
-    auto headers_overall_rlp_header = rlp::decode_header(payload_view);
-    ByteView headers_overall_view = payload_view.substr(0, headers_overall_rlp_header->payload_length);
-    if (headers_overall_rlp_header) {  // Skip invalid headers list rlp
-        auto headers_list_header = rlp::decode_header(headers_overall_view);
-        if (!headers_list_header || !headers_list_header->list) {
-            sys_println("Invalid headers list entry");
+    if (created_acc_hashes.size() > 1) [[likely]] {
+        auto* const data = created_acc_hashes.data();
+        const std::size_t n = created_acc_hashes.size();
+        if (n <= 16) [[likely]] {
+            for (std::size_t i = 1; i < n; ++i) {
+                zilkworm::AddrHashEntry key = std::move(data[i]);
+                std::size_t j = i;
+                while (j > 0 && key < data[j - 1]) {
+                    data[j] = std::move(data[j - 1]);
+                    --j;
+                }
+                data[j] = std::move(key);
+            }
         } else {
-            ByteView headers_list_view = headers_overall_view.substr(0, headers_list_header->payload_length);
-            while (!headers_list_view.empty()) {
-                auto entry_header{rlp::decode_header(headers_list_view)};
-                ByteView hh_view = headers_list_view.substr(0, entry_header->payload_length);
-                Block bb;
-                rlp::decode(hh_view, bb.header);
-                state.insert_block(bb, bb.header.hash());
-                headers_list_view.remove_prefix(entry_header->payload_length);
-            }
+            std::sort(data, data + n);
         }
     }
-    payload_view.remove_prefix(headers_overall_rlp_header->payload_length);
 
-    // Use Mainnet config.
-    // This can be latter extended to public testnets by providing chain id
-    // and selecting the appropriate config from kKnownChainConfigs.
-    Blockchain blockchain{state, kMainnetConfig, genesisBlock};
-
-    if (ValidationResult err{blockchain.insert_block(block, false)}; err != ValidationResult::kOk) {
-        sys_println(std::format("Validation error {}", magic_enum::enum_name<ValidationResult>(err)).c_str());
-        return 0;
-    }
-    auto pre_trie_head = rlp::decode_header(payload_view);
-    if (!pre_trie_head) {
-        sys_println("ERROR: Failed to Decode Pre-Trie List RLP");
-        return 0;
-    }
-    ByteView pre_trie_payload = payload_view.substr(0, pre_trie_head->payload_length);
-    payload_view.remove_prefix(pre_trie_head->payload_length);
-    if (!check_root(pre_trie_payload, state, block.header)) {
-        sys_println("ERROR: State Root Mismatch");
-    }
-
-    return block.header.gas_used;
-}
-
-bool StateTransition::check_root(ByteView pre_trie_payload, InMemoryState& state, BlockHeader& header) {
-    // Create and populate the node store
-    node_store_.populate_from_rlp(pre_trie_payload);
-
-    auto& acc_changes = state.account_changes().at(header.number);
-    const InMemoryState::StorageChanges& storage_changes = state.storage_changes().at(header.number);
     std::vector<mpt::TrieNodeFlat> acc_updates;
+    acc_updates.reserve(direct_state.addr_hashes().size() + created_acc_hashes.size());
 
-    Bytes val_rlp;
-    val_rlp.reserve(33);
-    for (auto& [addr, acc_opt] : acc_changes) {
-        const Account& acc = acc_opt.has_value() ? acc_opt.value() : Account{};
+    auto it_existing_hashes = direct_state.addr_hashes().begin();
+    auto end_it_existing = direct_state.addr_hashes().end();
+    auto it_created_hashes = created_acc_hashes.begin();
+    auto end_created_hashes = created_acc_hashes.end();
 
-        auto it = storage_changes.find(addr);
-        bytes32 storage_root{acc.storage_root_};
-        if (it != storage_changes.end()) {
-            std::vector<mpt::TrieNodeFlat> storage_updates{};
-            for (auto& [key, val] : it->second) {
-                auto cur_val = state.read_storage(addr, key);
-                if (cur_val == val) {
-                    continue;
-                }
-                auto zerolessVal = zeroless_view(cur_val.bytes);
-                val_rlp.clear();
-                rlp::encode(val_rlp, zerolessVal);
-                auto hashed_key = keccak_bytes32(key);
-                storage_updates.emplace_back(mpt::TrieNodeFlat{hashed_key, val_rlp});
+    std::vector<mpt::TrieNodeFlat> storage_spill;
+
+    // keccak(slot_key) depends only on key bytes (account- and block-independent),
+    // so entries never go stale. Soft cap bounds memory.
+    static thread_local FlatHashMap<bytes32, bytes32> keccak_cache_map = [] {
+        FlatHashMap<bytes32, bytes32> m;
+        m.reserve(4096);
+        return m;
+    }();
+    if (keccak_cache_map.size() > 16384) [[unlikely]] {
+        keccak_cache_map.clear();
+    }
+    auto keccak_cache = [&](const bytes32& key) [[gnu::always_inline]] -> const bytes32& {
+        auto [it, inserted] = keccak_cache_map.try_emplace(key);
+        if (inserted) [[unlikely]] {
+            it->second = keccak_bytes32(key);
+        }
+        return it->second;
+    };
+
+    mpt::GridMPT<true> storage_trie{direct_state, kEmptyRoot};
+
+    while (it_existing_hashes != end_it_existing || it_created_hashes != end_created_hashes) {
+        // Blob and created addr sets should be disjoint.
+        int cur_cmp = 0;
+        if (it_existing_hashes != end_it_existing && it_created_hashes != end_created_hashes) {
+            cur_cmp = std::memcmp(it_existing_hashes->addr_hash, it_created_hashes->addr_hash, 32);
+            if (cur_cmp == 0) [[unlikely]] {
+                sys_println("Created and existing hashes clash");
+                return false;
             }
+        }
+        const bool has_existing =
+            it_created_hashes == end_created_hashes ? true
+            : it_existing_hashes == end_it_existing ? false
+                                                    : cur_cmp < 0;
+        const auto& addr = *reinterpret_cast<const evmc::address*>(
+            has_existing ? it_existing_hashes->addr : it_created_hashes->addr);
 
-            if (storage_updates.size() > 0) {
-
-                if (mpt::is_zero_quick(acc.storage_root_)) {    // In case of a new account
-                    storage_root = kEmptyRoot;
+        {
+            const Account* rec = has_existing
+                                     ? direct_state.account_at_offset(it_existing_hashes->entry_offset)
+                                     : direct_state.find_created_account(addr);
+            if (rec->deleted) [[unlikely]] {
+                if (has_existing) {
+                    // 0x80 current value signals leaf deletion.
+                    auto& node = acc_updates.emplace_back(
+                        std::bit_cast<bytes32>(it_existing_hashes->addr_hash));
+                    node.ext_initial = ByteView{rec->acc_rlp_buf, rec->acc_rlp_len};
+                    node.buf[0] = 0x80;
+                    node.current_off = 0;
+                    node.current_len = 1;
+                    ++it_existing_hashes;
+                } else {
+                    // Created-then-destructed: no pre-trie leaf.
+                    ++it_created_hashes;
                 }
-                mpt::GridMPT<true> storage_trie{node_store_, storage_root};
-
-                std::sort(storage_updates.begin(), storage_updates.end());
-                storage_root = storage_trie.calc_root_from_updates(storage_updates);
+                continue;
             }
         }
-        auto cur_acc_opt = state.read_account(addr);
-        if (!cur_acc_opt.has_value()) {
-            sys_println(("ERROR: Account in acc_changes but not in storage" + to_hex(addr.bytes)).c_str());
-            continue;
-        }
-        auto& curr_acc = cur_acc_opt.value();
 
-        if (acc == *cur_acc_opt && storage_root == acc.storage_root_) {
-            continue;
+        Account* pa = has_existing
+                          ? direct_state.account_at_offset(it_existing_hashes->entry_offset)
+                          : direct_state.find_created_account(addr);
+
+        // Readonly accounts: pa.modified=false guarantees initial==current.
+        const bool acc_modified = has_existing ? pa->modified : true;
+
+        std::span<const zilkworm::Slot> existing_slots;
+        if (has_existing && pa->slot_count > 0) {
+            existing_slots = direct_state.slots_for(*pa).first(pa->slot_count);
         }
-        auto acc_rlp = curr_acc.rlp(storage_root);
-        auto addr_hash = keccak_bytes(addr.bytes);
-        acc_updates.emplace_back(addr_hash, acc_rlp);
+        const auto* created_slots = direct_state.overflow_slots_for(addr);
+
+        // Walk pre-state slots even with no SSTORE: binds slot.initial to keccak(key) under pa->storage_root.
+        const bool has_pre_slots = !existing_slots.empty();
+        const bool has_created = (created_slots != nullptr && !created_slots->empty());
+        bytes32 storage_root;
+        if (has_pre_slots || has_created) {
+            storage_root = std::bit_cast<bytes32>(pa->storage_root);
+            const std::size_t need = existing_slots.size() + (created_slots != nullptr
+                                                                  ? created_slots->size()
+                                                                  : 0);
+            zilkworm::InlineVec<mpt::TrieNodeFlat, 32> storage_updates(need, storage_spill);
+            for (const auto& slot : existing_slots) {
+                const auto& key = *reinterpret_cast<const bytes32*>(slot.key);
+                auto& node = storage_updates.emplace_back(keccak_cache(key));
+                node.self_initial_len = static_cast<uint8_t>(rlp::encode_into_small(
+                    node.buf + 0, zeroless_view(ByteView{slot.initial, 32})));
+                if (acc_modified && !zilkworm::eq_hash32(slot.initial, slot.current)) [[unlikely]] {
+                    node.current_off = 40;
+                    node.current_len = static_cast<uint8_t>(rlp::encode_into_small(
+                        node.buf + 40, zeroless_view(ByteView{slot.current, 32})));
+                }
+            }
+            if (created_slots != nullptr) {
+                for (const auto& [k, v] : *created_slots) {
+                    auto& node = storage_updates.emplace_back(keccak_cache(k));
+                    node.current_off = 40;
+                    node.current_len = static_cast<uint8_t>(rlp::encode_into_small(
+                        node.buf + 40, zeroless_view(ByteView{v.bytes, 32})));
+                }
+            }
+            // Raw-key order != keccak(key) order; sort required.
+            if (storage_updates.size() > 1) [[likely]] {
+                auto* const data = storage_updates.data();
+                const std::size_t n = storage_updates.size();
+                if (n <= 16) [[likely]] {
+                    for (std::size_t i = 1; i < n; ++i) {
+                        mpt::TrieNodeFlat key = std::move(data[i]);
+                        std::size_t j = i;
+                        while (j > 0 && key < data[j - 1]) {
+                            data[j] = std::move(data[j - 1]);
+                            --j;
+                        }
+                        data[j] = std::move(key);
+                    }
+                } else {
+                    std::sort(data, data + n);
+                }
+            }
+            if (mpt::is_zero_quick(storage_root)) {  // new account
+                storage_root = kEmptyRoot;
+            }
+            storage_trie.reset(storage_root);
+            storage_root = storage_trie.calc_root_from_updates(
+                {storage_updates.data(), storage_updates.size()});
+            assert(!storage_trie.failed());  // debug-only: in release caught by root compare below
+        }
+
+        bool readonly = false;
+        if (has_existing) {
+            auto& node = acc_updates.emplace_back(
+                std::bit_cast<bytes32>(it_existing_hashes->addr_hash));
+            node.ext_initial = ByteView{pa->acc_rlp_buf, pa->acc_rlp_len};
+            readonly = !acc_modified;
+            ++it_existing_hashes;
+        } else {
+            acc_updates.emplace_back(std::bit_cast<bytes32>(it_created_hashes->addr_hash));
+            ++it_created_hashes;
+        }
+
+        if (!readonly) {
+            if (!has_pre_slots && !has_created) {
+                storage_root = std::bit_cast<bytes32>(pa->storage_root);
+            }
+            auto& inserted = acc_updates.back();
+            inserted.current_off = 0;
+            inserted.current_len = pa->rlp_into(inserted.buf + 0, storage_root);
+        }
     }
 
-    std::sort(acc_updates.begin(), acc_updates.end());
-    auto prev_root = state.read_header(header.number - 1, header.parent_hash)->state_root;
-    mpt::GridMPT<false> acc_trie(node_store_, prev_root);
-    auto new_root = acc_trie.calc_root_from_updates(acc_updates);
-    return (new_root == header.state_root);
+    // acc_updates already sorted: merge of two sorted hash sequences.
+    auto prev_root = direct_state.read_header(header.number - 1, header.parent_hash)->state_root;
+    // First check_root in the run anchors the whole transition: commit it as the pre-state root in the guest public values.
+    if (!pre_root_set_) {
+        pre_state_root_ = prev_root;
+        pre_root_set_ = true;
+    }
+    mpt::GridMPT<true> acc_trie(direct_state, prev_root);
+    auto new_root = acc_trie.calc_root_from_updates({acc_updates.data(), acc_updates.size()});
+    assert(!acc_trie.failed());  // debug-only: in release caught by root compare below
+    sys_println(std::format("New Root: {}", to_hex(new_root)));
+    const bool ok = (new_root == header.state_root);
+    for (const auto& addr : direct_state.changed_addresses_journal()) {
+        if (direct_state.is_deleted(addr) || (clear_empty && direct_state.is_empty_account(addr))) continue;
+        Account* pa = direct_state.read_account(addr);
+        if (pa == nullptr) continue;
+        const auto storage_root = direct_state.account_storage_root(addr);
+        pa->rlp_into_cache(storage_root);
+    }
+    direct_state.clear_change_journal();
+    return ok;
 }
 
-uint64_t StateTransition::run() {
+bool StateTransition::check_root_new_block(DirectState& direct_state,
+                                           BlockHeader& header,
+                                           evmc_revision rev) {
+    const bool clear_empty = rev >= EVMC_SPURIOUS_DRAGON;
+    const auto& changed = direct_state.changed_addresses_journal();
+    for (const auto& addr : changed) {
+        if (direct_state.is_deleted(addr) || (clear_empty && direct_state.is_empty_account(addr))) continue;
+        Account* pa = direct_state.read_account(addr);
+        if (pa == nullptr) [[unlikely]] {
+            sys_println("ERROR: check_root_new_block journaled addr resolves to nullptr");
+            direct_state.clear_change_journal();
+            return false;
+        }
+        const auto storage_root = direct_state.account_storage_root(addr);
+        pa->rlp_into_cache(storage_root);
+    }
+
+    struct LeafRef {
+        bytes32 addr_hash;
+        ByteView rlp;
+    };
+    std::vector<LeafRef> leaves;
+    leaves.reserve(direct_state.addr_hashes().size() + direct_state.created_accounts().size());
+
+    for (const auto& e : direct_state.addr_hashes()) {
+        const auto& addr = *reinterpret_cast<const evmc::address*>(e.addr);
+        if (direct_state.is_deleted(addr) || (clear_empty && direct_state.is_empty_account(addr))) continue;
+        const Account* pa = direct_state.account_at_offset(e.entry_offset);
+        LeafRef r;
+        std::memcpy(r.addr_hash.bytes, e.addr_hash, 32);
+        r.rlp = ByteView{pa->acc_rlp_buf, pa->acc_rlp_len};
+        leaves.push_back(r);
+    }
+    for (const auto& [addr, pa] : direct_state.created_accounts()) {
+        if (direct_state.is_deleted(addr) || (clear_empty && direct_state.is_empty_account(addr))) continue;
+        LeafRef r;
+        const auto h = silkworm::keccak256(ByteView{addr.bytes, 20});
+        std::memcpy(r.addr_hash.bytes, h.bytes, 32);
+        r.rlp = ByteView{pa.acc_rlp_buf, pa.acc_rlp_len};
+        leaves.push_back(r);
+    }
+    std::sort(leaves.begin(), leaves.end(),
+              [](const LeafRef& a, const LeafRef& b) {
+                  return std::memcmp(a.addr_hash.bytes, b.addr_hash.bytes, 32) < 0;
+              });
+
+    silkworm::trie::HashBuilder hb;
+    for (const auto& r : leaves) {
+        hb.add_leaf(silkworm::trie::unpack_nibbles(ByteView{r.addr_hash.bytes, 32}),
+                    r.rlp);
+    }
+    const auto new_root = leaves.empty() ? kEmptyRoot : hb.root_hash();
+    sys_println(std::format("New Root (incremental): {}", to_hex(new_root)));
+    const bool ok = (new_root == header.state_root);
+    direct_state.clear_change_journal();
+    return ok;
+}
+
+StateTransition::Result StateTransition::run() {
+    uint64_t gas = kRunFailure;
+    if (envelope_.size() < 4) [[unlikely]] {
+        sys_println("ERROR: input envelope too small for magic");
+        failed_ = true;
+    } else {
+        uint32_t magic = 0;
+        std::memcpy(&magic, envelope_.data(), sizeof(uint32_t));
+        switch (magic) {
+            case ::zilkworm::kInputMagicEJSN:
+                gas = run_ejsn();
+                break;
+            case ::zilkworm::kInputMagicMFBD:
+                gas = run_mfbd();
+                break;
+            default:
+                sys_println("ERROR: unsupported input magic");
+                failed_ = true;
+                break;
+        }
+    }
+    return Result{
+        .gas_used = gas,
+        .pre_state_root = pre_state_root_,
+        .post_state_root = post_state_root_,
+        .block_hash = block_hash_,
+        .chain_id = chain_id_,
+    };
+}
+
+uint64_t StateTransition::run_ejsn() {
+    if (envelope_.size() < ::zilkworm::kInputHeaderSizeEJSN) [[unlikely]] {
+        sys_println("ERROR: EJSN envelope too small");
+        failed_ = true;
+        return kRunFailure;
+    }
+    uint32_t version = 0;
+    std::memcpy(&version, envelope_.data() + 4, sizeof(uint32_t));
+    if (version != ::zilkworm::kInputVersionEJSN) [[unlikely]] {
+        sys_println("ERROR: EJSN envelope bad version");
+        failed_ = true;
+        return kRunFailure;
+    }
+    const std::string_view json_str{
+        reinterpret_cast<const char*>(envelope_.data() + ::zilkworm::kInputHeaderSizeEJSN),
+        envelope_.size() - ::zilkworm::kInputHeaderSizeEJSN};
+
     bool any_failed = false;
     bool any_skipped = false;
-    const auto base_json = nlohmann::json::parse(json_str_);
+    const auto base_json = nlohmann::json::parse(json_str);
     for (const auto& [name, test] : base_json.items()) {
-        sys_println(std::format("  {}:", name).c_str());
         const auto result = blockchain_test(test);
         if (result.failed != 0) {
             any_failed = true;
@@ -456,11 +779,56 @@ uint64_t StateTransition::run() {
             sys_println("    passed");
         }
     }
-    if (any_failed)
-        return 1;
+    if (any_failed) {
+        failed_ = true;
+        return kRunFailure;
+    }
     if (any_skipped)
-        return 2;
+        return kRunSkipped;
     return 0;
+}
+
+uint64_t StateTransition::run_mfbd() {
+    auto align8 = [](size_t v) noexcept { return (v + 7u) & ~size_t{7u}; };
+
+    if (envelope_.size() < ::zilkworm::kInputHeaderSizeMFBD) [[unlikely]] {
+        sys_println("ERROR: MFBD envelope too small");
+        failed_ = true;
+        return kRunFailure;
+    }
+    uint32_t version = 0;
+    std::memcpy(&version, envelope_.data() + 4, sizeof(uint32_t));
+    if (version != ::zilkworm::kInputVersionMFBD) [[unlikely]] {
+        sys_println("ERROR: MFBD envelope bad version");
+        failed_ = true;
+        return kRunFailure;
+    }
+    uint64_t n_bundles = 0;
+    std::memcpy(&n_bundles, envelope_.data() + 8, sizeof(uint64_t));
+
+    const std::size_t end = envelope_.size();
+    std::size_t cursor = ::zilkworm::kInputHeaderSizeMFBD;
+    uint64_t cumulative_gas = 0;
+
+    for (uint64_t i = 0; i < n_bundles; ++i) {
+        std::span<uint8_t> tail{envelope_.data() + cursor, end - cursor};
+        auto fb = ::zilkworm::load_flat_bundle(tail);
+        if (!fb) [[unlikely]] {
+            sys_println("ERROR: MFBD bundle parse failed");
+            failed_ = true;
+            return kRunFailure;
+        }
+        auto [gas, ok] = run_one_bundle(*fb);
+        if (!ok) [[unlikely]] {
+            failed_ = true;
+            return kRunFailure;
+        }
+        cumulative_gas += gas;
+        cursor = align8(cursor + fb->blob.size());
+    }
+    if (n_bundles == 0)
+        return kRunSkipped;
+    return cumulative_gas;
 }
 
 }  // namespace silkworm::cmd::state_transition

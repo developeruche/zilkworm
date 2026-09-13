@@ -1,4 +1,5 @@
-// Copyright 2025 The Silkworm Authors
+// Copyright 2026 The Zilkworm Authors (modifications)
+// Copyright 2025 The Original Silkworm Authors
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
@@ -58,6 +59,10 @@ struct BlockHeader {
 
     // Added in Prague
     std::optional<evmc::bytes32> requests_hash{std::nullopt};  // EIP-7685
+
+    // Added in Amsterdam
+    std::optional<evmc::bytes32> block_access_list_hash{std::nullopt};  // EIP-7928
+    std::optional<uint64_t> slot_number{std::nullopt};                  // EIP-7843
 
     evmc::bytes32 hash(bool for_sealing = false, bool exclude_extra_data_sig = false) const;
 

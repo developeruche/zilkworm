@@ -1,5 +1,6 @@
 # Copyright 2025 The Zilkworm Authors
-# Copyright 2025 The Silkworm Authors
+# Copyright 2026 The Zilkworm Authors (modifications)
+# Copyright 2025 The Original Silkworm Authors
 # SPDX-License-Identifier: Apache-2.0
 
 # project(silkworm LANGUAGES CXX)
@@ -16,7 +17,7 @@ endif()
 
 if(QEMU_DEBUG)
     add_compile_definitions(-DQEMU_DEBUG)
-    include_directories(${CMAKE_SOURCE_DIR}/qemu_runner/src/include)
+    include_directories(${SILKWORM_MAIN_DIR}/qemu_runner/src/include)
 endif()
 
 add_subdirectory(core)

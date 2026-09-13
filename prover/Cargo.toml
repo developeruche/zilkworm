@@ -1,3 +1,6 @@
+# Copyright 2026 The Zilkworm Authors
+# SPDX-License-Identifier: Apache-2.0
+
 [workspace]
 members = [
     "common",
@@ -5,6 +8,7 @@ members = [
     "prover_turbo",
     "guest_turbo",
 ]
+exclude = ["stateless_validator"]
 resolver = "2"
 
 [workspace.dependencies]

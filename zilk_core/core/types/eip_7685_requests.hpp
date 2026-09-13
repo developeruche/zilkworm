@@ -1,4 +1,5 @@
-// Copyright 2025 The Silkworm Authors
+// Copyright 2026 The Zilkworm Authors (modifications)
+// Copyright 2025 The Original Silkworm Authors
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
@@ -20,7 +21,10 @@ using BLSSignature = std::array<uint8_t, kBLSSignatureLen>;
 enum class FlatRequestType : uint8_t {
     kDepositRequest = 0,
     kWithdrawalRequest = 1,
-    kConsolidationRequest = 2
+    kConsolidationRequest = 2,
+    // EIP-8282 (Amsterdam): builder execution request system contracts.
+    kBuilderDepositRequest = 3,
+    kBuilderExitRequest = 4,
 };
 
 struct FlatRequests {

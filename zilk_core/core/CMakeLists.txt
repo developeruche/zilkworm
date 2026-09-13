@@ -1,4 +1,5 @@
-# Copyright 2025 The Silkworm Authors
+# Copyright 2026 The Zilkworm Authors (modifications)
+# Copyright 2025 The Original Silkworm Authors
 # SPDX-License-Identifier: Apache-2.0
 
 include("${SILKWORM_MAIN_DIR}/cmake/common/targets.cmake")
@@ -22,6 +23,7 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(nlohmann_json)
 
+add_subdirectory(types_zz)
 
 if(SILKWORM_CORE_ONLY)
   if(MSVC)
@@ -36,6 +38,7 @@ set(SILKWORM_CORE_PUBLIC_LIBS
     evmone
     intx::intx
     magic_enum::magic_enum
+    silkworm_types_zz
     # secp256k1
 )
 set(SILKWORM_CORE_PRIVATE_LIBS

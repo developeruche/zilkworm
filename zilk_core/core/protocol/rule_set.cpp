@@ -1,4 +1,5 @@
-// Copyright 2025 The Silkworm Authors
+// Copyright 2026 The Zilkworm Authors (modifications)
+// Copyright 2025 The Original Silkworm Authors
 // SPDX-License-Identifier: Apache-2.0
 
 #include "rule_set.hpp"
@@ -9,7 +10,6 @@
 #include <zilk_core/core/common/empty_hashes.hpp>
 #include <zilk_core/core/common/overloaded.hpp>
 
-#include "bor_rule_set.hpp"
 #include "ethash_rule_set.hpp"
 #include "merge_rule_set.hpp"
 #include "param.hpp"
@@ -196,6 +196,22 @@ ValidationResult RuleSet::validate_block_header(const BlockHeader& header, const
         if (header.requests_hash) {
             return ValidationResult::kFieldBeforeFork;
         }
+    } else {
+        if (!header.requests_hash) {
+            return ValidationResult::kMissingField;
+        }
+    }
+
+    // EIP-7928 + EIP-7843 (Amsterdam): block_access_list_hash and slot_number
+    // are mandatory post-Amsterdam and forbidden pre-Amsterdam.
+    if (rev < EVMC_AMSTERDAM) {
+        if (header.block_access_list_hash || header.slot_number) {
+            return ValidationResult::kFieldBeforeFork;
+        }
+    } else {
+        if (!header.block_access_list_hash || !header.slot_number) {
+            return ValidationResult::kMissingField;
+        }
     }
     // return ValidationResult::kOk;
     return validate_difficulty_and_seal(header, *parent);
@@ -247,21 +263,6 @@ evmc::address RuleSet::get_beneficiary(const BlockHeader& header) { return heade
 BlockReward RuleSet::compute_reward(const Block&) {
     return {0, {}};
 }
-
-void RuleSet::add_fee_transfer_log(IntraBlockState&, const intx::uint256&, const evmc::address&,
-                                   const intx::uint256&, const evmc::address&, const intx::uint256&) {
-    // do nothing by default
-}
-
-// static RuleSetPtr pre_merge_rule_set(const ChainConfig& chain_config) {
-//     return std::visit<RuleSetPtr>(
-//         Overloaded{
-//             [&](const NoPreMergeConfig&) { return nullptr; },
-//             [&](const EthashConfig&) { return std::make_unique<EthashRuleSet>(chain_config); },
-//             [&](const bor::Config&) { return std::make_unique<BorRuleSet>(chain_config); },
-//         },
-//         chain_config.rule_set_config);
-// }
 
 RuleSetPtr rule_set_factory(const ChainConfig& chain_config) {
     // SILKWORM_ASSERT(chain_config.valid_pre_merge_config());

@@ -1,95 +1,49 @@
+// Copyright 2026 The Zilkworm Authors
+// SPDX-License-Identifier: Apache-2.0
+
 #include "./include/cppextern.hpp"
+#include <algorithm>
 #include <cstdio>
 #include <string>
+#include <utility>
 #include "./include/semihosting.hpp"
 #include <format>
 
-// Static buffer big enough for all the JSON payloads.
-static char JSON_BUF[200 * 1024 * 1024];
+static char ENV_BUF[200 * 1024 * 1024];
 
-int main(int argc, char* argv[])
+int main(int /*argc*/, char* /*argv*/[])
 {
-    // Read the entire input at once using SYS_READ on stdin (fd=0)
-    std::uint32_t n = 0;
-
-    // Open a handle
     int h = sh::open_file_read("stdin_payload.bin");
     if (h < 0)
     {
         sys_println("Failed to open file stdin_payload");
-        // sys_println("Failed to open tty_read");
-        sh::exit(1);
-    }
-    // int h = 0;
-
-    // First, read the number using a small buffer
-    char num_buf[32];
-    std::size_t num_len = sh::read_handle(h, num_buf, sizeof(num_buf));
-
-    std::size_t i = 0;
-    bool is_test = 0;
-
-    //Skip blanks
-    while (i < num_len && (num_buf[i] == ' ' || num_buf[i] == '\t' ||
-        num_buf[i] == '\r' || num_buf[i] == '\n'))
-    {
-        i++;
-    }
-    // Read is_test
-    if (i < num_len && num_buf[i] == '0' || num_buf[i] == '1') {
-        is_test = num_buf[i] - '0';
-        i++;
-        // Skip blanks
-        while (i < num_len && (num_buf[i] == ' ' || num_buf[i] == '\t' ||
-            num_buf[i] == '\r' || num_buf[i] == '\n'))
-        {
-            i++;
-        }
-    }
-
-    // Read n
-    while (i < num_len && num_buf[i] >= '0' && num_buf[i] <= '9')
-    {
-        n = n * 10 + (num_buf[i] - '0');
-        i++;
-    }
-
-    // Now read the JSON data
-    if (n >= sizeof(JSON_BUF))
-    {
-        sys_println("File too large for JSON_BUF");
         sh::exit(1);
     }
 
-    // Skip blanks
-    while (i < num_len && (num_buf[i] == ' ' || num_buf[i] == '\t' ||
-        num_buf[i] == '\r' || num_buf[i] == '\n'))
+    std::size_t total = 0;
+    constexpr std::size_t kChunk = 64 * 1024;
+    while (total < sizeof(ENV_BUF))
     {
-        i++;
+        const std::size_t want = std::min<std::size_t>(kChunk, sizeof(ENV_BUF) - total);
+        const std::size_t got = sh::read_handle(h, ENV_BUF + total, want);
+        if (got == 0)
+            break;
+        total += got;
     }
 
-    // Copy any leftover bytes from num_buf
-    std::size_t copied = 0;
-    while (i < num_len && copied < n)
+    if (total == sizeof(ENV_BUF))
     {
-        JSON_BUF[copied++] = num_buf[i++];
-    }
-
-    // Read the rest directly
-    std::size_t got = sh::read_exact_handle(h, JSON_BUF + copied, n - copied);
-    if (got == 0)
-    {
-        sys_println("Unexpected EOF");
+        sys_println("Payload exceeded ENV_BUF capacity");
         sh::exit(1);
     }
-    copied += got;
-    std::string jsonStr(JSON_BUF, JSON_BUF + n);
+
+    std::string envelope_str(ENV_BUF, ENV_BUF + total);
     char buf[64];
-    std::snprintf(buf, sizeof(buf), "Input file read length: %zu", jsonStr.size());
+    std::snprintf(buf, sizeof(buf), "Input envelope size: %zu", envelope_str.size());
     sys_println(buf);
-    const uint64_t res = sample_run_wrapped(is_test, jsonStr);
+    // ctest-compatible exit code: 0 = passed, 1 = failed, 2 = skipped.
+    const int exit_code = static_cast<int>(sample_run_wrapped(std::move(envelope_str)));
 
-    // Exit QEMU with the result code
-    sys_println(std::format("Run complete. Result: {}", res));
-    sh::exit(static_cast<int>(res));
+    sys_println(std::format("Run complete. exit={}", exit_code));
+    sh::exit(exit_code);
 }

@@ -1,4 +1,5 @@
-// Copyright 2025 The Silkworm Authors
+// Copyright 2026 The Zilkworm Authors (modifications)
+// Copyright 2025 The Original Silkworm Authors
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
@@ -47,6 +48,15 @@ class HashBuilder {
 
     //! \brief Pointer to function for collecting nodes in etl.
     NodeCollector node_collector{nullptr};
+
+    //! \brief Optional per-node-RLP collector.
+    //! Fires once for every emitted node RLP whose length is >= 32 bytes
+    //! (the ones that get keccak-hashed and become referenced by hash).
+    //! The callback receives the raw node RLP bytes; the caller is
+    //! responsible for keccak'ing if a (hash → rlp) map is needed.
+    //! Default-nullptr — no cost for guest / non-witness-producer callers.
+    using RlpCollector = std::function<void(ByteView node_rlp)>;
+    RlpCollector rlp_collector{nullptr};
 
     //! \brief Resets the builder as newly created
     void reset();

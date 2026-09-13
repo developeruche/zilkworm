@@ -1,4 +1,5 @@
-// Copyright 2025 The Silkworm Authors
+// Copyright 2026 The Zilkworm Authors (modifications)
+// Copyright 2025 The Original Silkworm Authors
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
@@ -6,14 +7,20 @@
 #include <cstdint>
 #include <vector>
 
+#include <evmc/evmc.hpp>
+#include <evmone/test/state/bal.hpp>
 #include <evmone/test/state/block.hpp>
 #include <evmone/test/state/state_diff.hpp>
-#include <zilk_core/core/execution/evm.hpp>
+#include <zilk_core/core/chain/config.hpp>
 #include <zilk_core/core/protocol/rule_set.hpp>
-#include <zilk_core/core/state/state.hpp>
+#include <zilk_core/core/protocol/validation.hpp>
+#include <zilk_core/core/state_zz/direct_state.hpp>
 #include <zilk_core/core/types/block.hpp>
 #include <zilk_core/core/types/receipt.hpp>
 #include <zilk_core/core/types/transaction.hpp>
+
+using ::zilkworm::DirectState;
+using ::zilkworm::DirectStateView;
 
 namespace silkworm {
 
@@ -22,7 +29,10 @@ class ExecutionProcessor {
     ExecutionProcessor(const ExecutionProcessor&) = delete;
     ExecutionProcessor& operator=(const ExecutionProcessor&) = delete;
 
-    ExecutionProcessor(const Block& block, protocol::RuleSet& rule_set, State& state, const ChainConfig& config, bool evm1_v2);
+    ExecutionProcessor(const Block& block, protocol::RuleSet& rule_set,
+                       DirectState& direct, const ChainConfig& config);
+
+    ~ExecutionProcessor();
 
     /**
      * Execute a transaction, but do not write to the DB yet.
@@ -30,55 +40,40 @@ class ExecutionProcessor {
      */
     void execute_transaction(const Transaction& txn, Receipt& receipt) noexcept;
 
-    CallResult call(const Transaction& txn, bool refund) noexcept;
-
     //! \brief Execute the block.
     //! \remarks Warning: This method does not verify state root; pre-Byzantium receipt root isn't validated either.
     //! \pre RuleSet's validate_block_header & pre_validate_block_body must return kOk.
     ValidationResult execute_block(std::vector<Receipt>& receipts) noexcept;
 
-    //! \brief Flush IntraBlockState into cumulative State.
-    void flush_state();
-
     uint64_t available_gas() const noexcept;
 
-    EVM& evm() noexcept { return evm_; }
-    const EVM& evm() const noexcept { return evm_; }
-    IntraBlockState& intra_block_state() { return state_; }
-    const IntraBlockState& intra_block_state() const { return state_; }
-
-    void reset();
+  public:
+    //! Look up an ancestor block hash via the witness-side header store.
+    //! Public so the file-local BlockHashes adapter (evmone callback) can forward.
+    evmc::bytes32 get_block_hash_for_evm(int64_t block_num) const noexcept;
 
   private:
-    //! Update the transaction-context-wide access sets introduced by EIP-2929 and refined in EIP-3651
-    void update_access_lists(const evmc::address& sender, const Transaction& txn, evmc_revision rev) noexcept;
+    //! Evaluate the chain's revision at the current block's number/timestamp.
+    evmc_revision revision() const noexcept;
 
-    /**
-     * Execute the block, but do not write to the DB yet.
-     * Does not perform any post-execution validation (for example, receipt root is not checked).
-     * Precondition: validate_block_header & pre_validate_block_body must return kOk.
-     */
+    /// Apply an evmone StateDiff to DirectState.
+    void apply_state_diff(const evmone::state::StateDiff& diff);
     ValidationResult execute_block_no_post_validation(std::vector<Receipt>& receipts) noexcept;
 
-    // //! \brief Notify the registered tracers at the start of block execution.
-    // void notify_block_execution_start(const Block& block);
-
-    // //! \brief Notify the registered tracers at the end of block execution.
-    // void notify_block_execution_end(const Block& block);
-
-    uint64_t calculate_refund_gas(const Transaction& txn, uint64_t gas_left, uint64_t gas_refund) const noexcept;
-
-    /// Apply an evmone StateDiff to state_.
-    void apply_state_diff(const evmone::state::StateDiff& diff);
-
     uint64_t cumulative_gas_used_{0};
-    IntraBlockState state_;
+    // EIP-7778/8037 (Amsterdam): per-dimension block gas accounting.
+    int64_t sum_regular_block_gas_{0};
+    int64_t sum_state_block_gas_{0};
+    // EIP-7928 (Amsterdam): block-level access list under construction.
+    evmone::state::BalBuilder bal_builder_{};
+    size_t tx_index_{0};
+    DirectState& direct_;
     protocol::RuleSet& rule_set_;
-    EVM evm_;
+    const Block& block_;
+    const ChainConfig& config_;
+    evmc::address beneficiary_;
+    evmc::VM vm_;
     evmone::state::BlockInfo evm1_block_;
-
-    //! Execute transactions using evmone APIv2 only and apply the result state diff to the state.
-    bool evm1_v2_ = false;
 };
 
 }  // namespace silkworm

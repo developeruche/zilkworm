@@ -1,4 +1,5 @@
-// Copyright 2025 The Silkworm Authors
+// Copyright 2026 The Zilkworm Authors (modifications)
+// Copyright 2025 The Original Silkworm Authors
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
@@ -6,16 +7,17 @@
 #include <optional>
 
 #include <evmc/evmc.h>
-#include <zilk_core/core/state/intra_block_state.hpp>
+#include <zilk_core/core/state_zz/direct_state.hpp>
 #include <zilk_core/core/types/block.hpp>
 #include <zilk_core/core/types/transaction.hpp>
 
 namespace silkworm {
 
-class EVM;
-
 // Classification of invalid transactions and blocks.
-enum class [[nodiscard]] ValidationResult {
+// Underlying type is fixed at `int` so consumers can safely store/forward
+// non-enumerator sentinel values (e.g. test runners that distinguish
+// pre-validate short-circuits from real ValidationResult codes).
+enum class [[nodiscard]] ValidationResult : int {
     kOk,  // All checks passed
 
     kUnknownProtocolRuleSet,  // Unsupported protocol rule set
@@ -107,6 +109,10 @@ enum class [[nodiscard]] ValidationResult {
     // EIP-7825
     kMaxTransactionGasLimitExceeded,
 
+    // EIP-7928: Block-Level Access Lists
+    kBlockAccessListGasExceeded,   // BAL item count exceeds block.gas_limit / GAS_PER_ITEM
+    kBlockAccessListHashMismatch,  // computed BAL hash != header.block_access_list_hash
+
     // Bor validation errors. See https://github.com/erigontech/erigon/blob/main/consensus/bor/bor.go
     kMissingVanity,          // Block's extra-data section is shorter than 32 bytes, which is required to store the signer vanity
     kMissingSignature,       // Block's extra-data section doesn't seem to contain a 65 byte secp256k1 signature
@@ -133,18 +139,12 @@ namespace protocol {
     //!
     //! Precondition:
     //! pre_validate_transaction(txn) must return kOk
-    ValidationResult validate_transaction(const Transaction& txn, const IntraBlockState& state,
+    ValidationResult validate_transaction(const Transaction& txn, const ::zilkworm::DirectState& state,
                                           uint64_t available_gas) noexcept;
-
-    ValidationResult validate_call_precheck(const Transaction& txn, const EVM& evm) noexcept;
 
     ValidationResult pre_validate_common_base(const Transaction& txn, evmc_revision revision, uint64_t chain_id) noexcept;
 
     ValidationResult pre_validate_common_forks(const Transaction& txn, evmc_revision rev, const std::optional<intx::uint256>& blob_gas_price) noexcept;
-
-    ValidationResult validate_call_funds(const Transaction& txn, const EVM& evm, const intx::uint256& owned_funds, bool bailout) noexcept;
-
-    intx::uint256 compute_call_cost(const Transaction& txn, const intx::uint256& effective_gas_price, const EVM& evm);
 
     //! \see EIP-1559: Fee market change for ETH 1.0 chain
     intx::uint256 expected_base_fee_per_gas(const BlockHeader& parent);

@@ -1,4 +1,8 @@
-# [build]
+# Copyright 2026 The Zilkworm Authors
+# SPDX-License-Identifier: Apache-2.0
+
+[build]
+target-dir = "prover/target"
 # target = "riscv32im-unknown-none-elf"
 # [target.riscv32im-unknown-none-elf]
 # linker = "riscv-none-elf-gcc"

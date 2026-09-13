@@ -1,4 +1,5 @@
-// Copyright 2025 The Silkworm Authors
+// Copyright 2026 The Zilkworm Authors (modifications)
+// Copyright 2025 The Original Silkworm Authors
 // SPDX-License-Identifier: Apache-2.0
 
 #include "ethash_rule_set.hpp"
@@ -55,23 +56,25 @@ ValidationResult EthashRuleSet::validate_extra_data(const BlockHeader& header) c
     return RuleSet::validate_extra_data(header);
 }
 
-void EthashRuleSet::initialize(EVM& evm) {
-    if (evm.block().header.number == evm.config().dao_block) {
-        transfer_dao_balances(evm.state());
+void EthashRuleSet::initialize(const Block& block, DirectState& direct) {
+    if (block.header.number == chain_config_.dao_block) {
+        transfer_dao_balances(direct);
     }
 }
 
-ValidationResult EthashRuleSet::finalize(IntraBlockState& state, const Block& block, EVM&, const std::vector<Log>&) {
+ValidationResult EthashRuleSet::finalize(DirectState& direct, const Block& block,
+                                         const std::vector<Log>&) {
     const BlockReward reward{compute_reward(block)};
-    state.add_to_balance(get_beneficiary(block.header), reward.miner);
+    const auto miner = get_beneficiary(block.header);
+    direct.add_to_balance(miner, reward.miner);
     for (size_t i{0}; i < block.ommers.size(); ++i) {
-        state.add_to_balance(block.ommers[i].beneficiary, reward.ommers[i]);
+        direct.add_to_balance(block.ommers[i].beneficiary, reward.ommers[i]);
     }
     return ValidationResult::kOk;
 }
 
 static intx::uint256 block_reward_base(const evmc_revision rev) {
-    if (rev >= EVMC_CONSTANTINOPLE) {
+    if (rev >= EVMC_PETERSBURG) {
         return kBlockRewardConstantinople;
     }
     if (rev >= EVMC_BYZANTIUM) {
@@ -148,7 +151,7 @@ intx::uint256 EthashRuleSet::difficulty(
     } else if (config.muir_glacier_block.has_value() && block_num >= config.muir_glacier_block) {
         // EIP-2384: Muir Glacier Difficulty Bomb Delay
         bomb_delay = 9'000'000;
-    } else if (rev >= EVMC_CONSTANTINOPLE) {
+    } else if (rev >= EVMC_PETERSBURG) {
         // EIP-1234: Constantinople Difficulty Bomb Delay and Block Reward Adjustment
         bomb_delay = 5'000'000;
     } else if (rev >= EVMC_BYZANTIUM) {

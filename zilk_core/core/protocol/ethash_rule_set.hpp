@@ -1,4 +1,5 @@
-// Copyright 2025 The Silkworm Authors
+// Copyright 2026 The Zilkworm Authors (modifications)
+// Copyright 2025 The Original Silkworm Authors
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
@@ -14,12 +15,11 @@ class EthashRuleSet : public RuleSet {
   public:
     explicit EthashRuleSet(const ChainConfig& chain_config) : RuleSet(chain_config, /*prohibit_ommers=*/false) {}
 
-    void initialize(EVM& evm) override;
+    void initialize(const Block& block, DirectState& direct) override;
 
     //! \brief See [YP] Section 11.3 "Reward Application".
-    //! \param [in] state: current state.
-    //! \param [in] block: current block to apply rewards for.
-    ValidationResult finalize(IntraBlockState& state, const Block& block, EVM& evm, const std::vector<Log>& logs) override;
+    ValidationResult finalize(DirectState& direct, const Block& block,
+                              const std::vector<Log>& logs) override;
 
     BlockReward compute_reward(const Block& block) override;
 

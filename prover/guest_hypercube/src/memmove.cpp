@@ -1,3 +1,6 @@
+// Copyright 2026 The Zilkworm Authors
+// SPDX-License-Identifier: Apache-2.0
+
 // Optimized memmove for SP1 zkVM.
 //
 // In SP1, memmove is called extensively by std::string operations
@@ -7,7 +10,7 @@
 
 #include <cstring>
 
-extern "C" void *memmove(void *dest, const void *src, size_t n) noexcept {
+extern "C" void *__wrap_memmove(void *dest, const void *src, size_t n) noexcept {
     auto *d = static_cast<unsigned char *>(dest);
     const auto *s = static_cast<const unsigned char *>(src);
     if (d <= s || d >= s + n) [[likely]]

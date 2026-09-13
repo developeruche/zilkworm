@@ -1,4 +1,5 @@
-// Copyright 2025 The Silkworm Authors
+// Copyright 2026 The Zilkworm Authors (modifications)
+// Copyright 2025 The Original Silkworm Authors
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
@@ -22,9 +23,10 @@ class MergeRuleSet : public RuleSet {
 
     ValidationResult validate_ommers(const Block& block, const BlockState& state) override;
 
-    void initialize(EVM& evm) override;
+    void initialize(const Block& block, DirectState& direct) override;
 
-    ValidationResult finalize(IntraBlockState& state, const Block& block, EVM& evm, const std::vector<Log>& logs) override;
+    ValidationResult finalize(DirectState& direct, const Block& block,
+                              const std::vector<Log>& logs) override;
 
     evmc::address get_beneficiary(const BlockHeader& header) override;
 

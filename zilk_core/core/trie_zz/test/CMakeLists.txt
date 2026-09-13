@@ -1,4 +1,4 @@
-# Copyright 2025 The Silkworm Authors
+# Copyright 2026 The Zilkworm Authors
 # SPDX-License-Identifier: Apache-2.0
 
 find_package(Microsoft.GSL REQUIRED)
